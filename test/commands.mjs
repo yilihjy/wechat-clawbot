@@ -76,6 +76,15 @@ for (const name of ["#任务状态", "#当前模式", "#帮助"]) {
 }
 check("unknown reply names the command it did not find", unknownCommandReply("#切换").includes("#切换"));
 
+// The agent's own prompt has to know these exist: without it, "接管那个会话"
+// gets hallucinated instead of answered with the command that can do it.
+const { buildWechatSystemPrompt } = await import(join(ROOT, "lib/prompt.js"));
+const guidance = buildWechatSystemPrompt(false);
+for (const name of ["#任务状态", "#接管 N", "#交还", "#入库"]) {
+  check(`the agent prompt names ${name}`, guidance.includes(name));
+}
+check("the prompt says command messages never reach the agent", guidance.includes("到不了你这里"));
+
 // ---------------------------------------------------------------- handlers (D29 notes)
 
 // A fake host: two sessions, titles included. Only what `listDshSessions` reads.
