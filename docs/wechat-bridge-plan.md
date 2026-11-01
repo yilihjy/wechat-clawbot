@@ -285,7 +285,7 @@ v1 不写入工作台，桥自己留 90 天。
 
 `ctx.on('session/event', …)` 在根上下文注册，接收**所有会话**的事件（Cordis 子上下文原型继承共享同一张 hook 表；session store 用 `emitCtx: this.ctx` 发事件）。→ relay 不需要 `sessionController`，换过滤器即可。
 
-### F3 自动审查故障的真实原因
+### F3 自动审查故障的真实原因（2026-11-01 复现两次）
 
 官方 `auto` 档下，审查请求走**会话的 provider**；若落到 `opencode-go`，因缺少 `x-opencode-session` 头返回 400 `MissingSessionID`，而 auto-review 是 fail-closed → **所有工具都不执行**，连 `send_wechat_text` 也失败（agent 变哑巴）。
 
@@ -309,6 +309,21 @@ v1 不写入工作台，桥自己留 90 天。
 
 所以：界面点选只写 `pending`；**只有真的发出去的那次请求才会推进 `lastUsed` 与请求头**。
 若插件另外安装了 `ModelSelectionRef` 覆盖（旧行为），请求头永远不会推进，审核就一直用旧路由 → 持续 400。
+
+### F9 两个组合的实测（2026-11-01 22:50–23:00）
+
+| 组合 | 结果 |
+|---|---|
+| 官方 key + 审查开（`wechat-auto` 档） | `request/header` = `deepseek-official/deepseek-flash`；13 次工具调用零 400，回复免审 |
+| opencode-go + 审查关（`danger-full-access` 档） | `request/header` 在 22:55:40 **随 UI 切换推进**到 `opencode-go/deepseek-v4.1-flash`；20+ 次工具调用零 400 |
+
+结论：
+- **镜像修复成立**——`model/selection` 能推进请求头（修复前 22:17 那次一动不动）；
+- **档位开关成立**——换档位即开/关审查；
+- **provider 闸门成立**——opencode 下审查自动跳过，不会把工具层打死。
+
+代价：opencode 这条路由**无法被审查**（网关要求 `x-opencode-session`，评审是独立请求），
+等上游修好 header 透传前，它就是"无审查的全权模式"。
 
 ### F7 本机版本
 
