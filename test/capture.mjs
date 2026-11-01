@@ -264,6 +264,24 @@ const noId = await captureUrl(
 );
 check("a response without an id is a server failure", noId.ok === false && noId.kind === "server");
 
+// A declared-huge response is refused before it is read (a phone link can point anywhere).
+const huge = await captureUrl(
+  "https://example.com/huge",
+  CONFIG,
+  stub([
+    {
+      match: () => true,
+      reply: () =>
+        new Response("<html>never read</html>", {
+          status: 200,
+          headers: { "content-length": "99000000" },
+        }),
+    },
+  ]),
+);
+check("an oversized page is refused", huge.ok === false && huge.kind === "fetch");
+check("its receipt says nothing could be read", captureReceipt(huge).includes("抓不到正文"));
+
 // ---------------------------------------------------------------- report
 
 if (failures.length > 0) {

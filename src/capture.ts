@@ -32,6 +32,9 @@ const POST_TIMEOUT_MS = 20_000;
 /** The workbench refuses more than this much html (4 MB); staying under it keeps the whole page. */
 const MAX_HTML_BYTES = 4_000_000;
 
+/** Largest page we are willing to read into memory at all (10 MB: articles are ~3.5 MB). */
+const MAX_PAGE_BYTES = 10_000_000;
+
 /** D25: under this many characters a capture is stored anyway, but the receipt says so. */
 export const SHORT_TEXT_CHARS = 200;
 
@@ -265,8 +268,15 @@ export async function fetchPage(url: string, fetchImpl: FetchLike = fetch): Prom
     redirect: "follow",
     signal: AbortSignal.timeout(PAGE_TIMEOUT_MS),
   });
+  // A link from a phone can point at anything, including a multi-gigabyte file.
+  // Refuse on the declared length before reading a byte; chunked responses
+  // without a length are bounded by the timeout and the trim below.
+  const declared = Number(res.headers.get("content-length") ?? "");
+  if (Number.isFinite(declared) && declared > MAX_PAGE_BYTES) {
+    return { status: res.status, url: res.url === "" ? url : res.url, html: "" };
+  }
   const html = await res.text();
-  return { status: res.status, url: res.url === "" ? url : res.url, html };
+  return { status: res.status, url: res.url === "" ? url : res.url, html: html.length > MAX_PAGE_BYTES ? "" : html };
 }
 
 /** The shape `POST /api/v1/extension/captures` answers with (only the fields a receipt needs). */
