@@ -331,6 +331,34 @@ DSH `0.2.1-rc.5`（检查兼容性时用 `includePrerelease`，所以 `0.2.1-rc.
 
 ---
 
+## 5.1 进展（2026-11-01）
+
+**已落地并实机验证**
+
+| 项 | 位置 |
+|---|---|
+| 桥的分叉（上游 + 19 行模型镜像 + 本文件） | `~/workspace/wechat-clawbot`，`main` |
+| 审核的分叉（按会话 + 档位开关 + provider 闸门 + 回复白名单） | `~/workspace/dsh-auto-review` |
+| profile 配置 | `clawbot`（cwd/provider/model）、`permission.presets.wechat-auto`（显示「微信自动审查」）、`auto-review-wechat` |
+| 凭证迁移（复用探针绑定，未重扫码） | `~/.dsh/clawbot/{accounts,openclaw-weixin}` |
+| 两种组合实测（见 F9） | 官方 key + 审查开；opencode + 审查关 |
+| 入站形态全测（见 F1） | 文本 / 卡片 / 短链 / 长链 / 图片 / 文件 / 语音 / 引用 / 转发 / 连发 |
+| 媒体解密链路 | `full_url` → base64(hex) 密钥 → AES-128-ECB，md5 校验 |
+| 命令层 / 采集 / 账本 / 时间线 | **均未实现**（决策已定，见 §2–§4） |
+
+**上游 PR**
+
+- `Alphainfix/wechat-clawbot#2` —— `fix(model): follow a model picked in the web UI when nothing is pinned`
+  （19 行，只含这一个 hunk；分支 `pr/model-follow-ui`）。
+  若被接受，`main` 上那 19 行本地改动会在 rebase 后自然消失，fork 的源码 diff 归零。
+
+**待提的候选（尚未动手）**
+
+1. `claudePeer` 缺开关（上游无条件注册 3 个工具，而 `codexPeer` / `macCalendar` / `mcpBridge` 都有开关）；
+2. 入站原文日志无开关（`src/inbound.ts` 把每条消息正文写 `inbound-raw.jsonl`）；
+3. 游标先落盘再处理（`src/monitor.ts:101`，崩溃会跳过整批；且写盘无 try/catch）；
+4. `approvalTimeoutMs` 默认 0（永不超时）。
+
 ## 6. 未定（讨论中）
 
 | 编号 | 议题 |
