@@ -418,6 +418,7 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
       bridge,
       pending,
       sendText,
+      ctx,
     });
 
     abort = new AbortController();

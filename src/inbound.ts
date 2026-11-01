@@ -7,6 +7,8 @@
 import fs from "node:fs";
 import path from "node:path";
 
+import type { Context } from "@deepseek-ai/cordis";
+
 import type { MessageItem, WeixinMessage } from "./ilink/api/types.js";
 import { MessageItemType } from "./ilink/api/types.js";
 import { resolveStateDir } from "./ilink/storage/state-dir.js";
@@ -18,6 +20,7 @@ import type { WechatBridge } from "./bridge.js";
 import { PendingRegistry } from "./pending.js";
 import { loadContextToken, saveContextToken } from "./state.js";
 import { logger } from "./ilink/util/logger.js";
+import { routeInboundCommand, runCommand, stripEscape, unknownCommandReply } from "./commands.js";
 
 function isMediaItem(item: MessageItem | undefined): boolean {
   return (
@@ -123,6 +126,7 @@ export class InboundRouter {
   private readonly bridge: WechatBridge;
   private readonly pending: PendingRegistry;
   private readonly sendText: (to: string, text: string) => Promise<void>;
+  private readonly ctx: Context;
 
   constructor(deps: {
     config: ClawbotConfig;
@@ -130,12 +134,15 @@ export class InboundRouter {
     bridge: WechatBridge;
     pending: PendingRegistry;
     sendText: (to: string, text: string) => Promise<void>;
+    /** Root context, for the command layer's session queries. */
+    ctx: Context;
   }) {
     this.config = deps.config;
     this.account = deps.account;
     this.bridge = deps.bridge;
     this.pending = deps.pending;
     this.sendText = deps.sendText;
+    this.ctx = deps.ctx;
   }
 
   /** Whether a sender may talk to the agent. */
@@ -219,8 +226,30 @@ export class InboundRouter {
   /** Everything after the sender is known and allowed. */
   private async route(msg: WeixinMessage, sender: string): Promise<void> {
     const plainText = extractPlainText(msg);
-    const body = bodyFromItemList(msg.item_list);
+    let body = bodyFromItemList(msg.item_list);
     const quotePrefix = buildQuotePrefix(msg, this.bridge);
+
+    // >>> local: 命令层（D7–D11）
+    // 一整条消息正好是命令时在这里答复。位置必须在 pending 消费之前：
+    // 只读命令不能被挂着的审批当成答复吃掉。未识别的 `#…` 也只回帮助，
+    // 不下发给 agent —— 打错命令要有确定结果。
+    const routed = routeInboundCommand(plainText);
+    if (routed.kind === "unknown") {
+      await this.sendText(sender, unknownCommandReply(routed.raw)).catch(() => {});
+      return;
+    }
+    if (routed.kind === "command") {
+      const reply = await runCommand(routed, {
+        ctx: this.ctx,
+        sessionId: this.config.sessionId,
+        ...(this.config.cwd === undefined ? {} : { cwd: this.config.cwd }),
+      }).catch((err: unknown) => `命令执行失败：${String((err as Error).message ?? err)}`);
+      if (reply !== "") await this.sendText(sender, reply).catch(() => {});
+      return;
+    }
+    // `>` 逃逸：剥掉标记，其余原样交给 agent。
+    if (routed.kind === "escape") body = stripEscape(body);
+    // <<< local
 
     // A pending approval/question for this sender wins over a new turn.
     // A voice reply answers it too (WeChat transcribes voice itself). A reply
