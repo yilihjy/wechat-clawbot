@@ -439,6 +439,21 @@ inbound-raw.jsonl     00:14:16 seq=52 text='#帮助'
 也就是说：公众号文章在**服务端**就能抓（不需要浏览器），手机 UA 足够；
 `chksm` 那类参数必须丢掉，否则同一篇文章会被当成新链接。
 
+### F12 重启前核对：profile 的软链能拿到新构建（2026-11-02 00:50）
+
+不重启也能证明"重启会加载到这份代码"：profile 里的插件是软链
+（`~/.dsh/profiles/desktop/node_modules/wechat-clawbot` → `~/workspace/wechat-clawbot`），
+`main` 指向 `lib/index.js`。直接按这条路径 import：
+
+```
+entry    name=clawbot, apply=function
+schema   新增字段 captureEnabled / captureBaseUrl / captureToken 都在
+modules  capture.captureUrl / relay.RelayService / modes.ModeStore / approvals.approvalRoute 都可加载
+```
+
+注意 `apply()` 本身没被执行——它需要真宿主。所以这条只能证明"构建产物与软链是对的"，
+证明不了"行为是对的"；行为仍要重启后按 §9 的清单验。
+
 ### F7 本机版本
 
 DSH `0.2.1-rc.5`（检查兼容性时用 `includePrerelease`，所以 `0.2.1-rc.x` 满足 `^0.2.1-rc.1`）；`@deepseek-ai/dsh-experimental-auto-review` 分叉自 tag `dsh-v0.2.1-rc.5`。
@@ -529,6 +544,8 @@ DSH `0.2.1-rc.5`（检查兼容性时用 `includePrerelease`，所以 `0.2.1-rc.
 本次改动全在插件里，**不重启不会生效**（命令层当时也是这样验证的）。
 重启后按这个顺序验收：
 
+0. 重启后先看日志里那两行：`clawbot instance #N active`（插件起来了）和
+   `ensureTools: WeChat tools registered`（工具注册成功）。没有这两行就别再往下试；
 1. `#帮助` —— 应该多出 `#接管 N` / `#交还` / `#入库 <链接>` 三行（命令表是活的判据，不用等模型）；
 2. `#任务状态` —— 记下编号，然后 `#接管 1`，看回执里的《标题》与剩余分钟；
 3. 在桌面端那个被接管的会话里发一句「你好」，微信应收到 `[标题] …`（一个回合一条）；
