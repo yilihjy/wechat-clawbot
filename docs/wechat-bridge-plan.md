@@ -356,6 +356,22 @@ v1 不写入工作台，桥自己留 90 天。
 代价：opencode 这条路由**无法被审查**（网关要求 `x-opencode-session`，评审是独立请求），
 等上游修好 header 透传前，它就是"无审查的全权模式"。
 
+### F10 命令层生效的判据（2026-11-02 00:14 实测）
+
+命令的答复**不经过 agent**，所以证据是"入站有、会话没有"：
+
+```
+inbound-raw.jsonl     00:14:16 seq=52 text='#帮助'
+                      00:14:43 seq=53 text='#当前模式 '
+
+会话日志              00:13:59 turn/end  ←「在线吗」结束
+                      00:15:23 turn/start ←「很好，告诉那个对话…」开始
+                      （中间两条命令：没有 turn、没有 tool/call）
+```
+
+对照生效前：23:43:10 的 `#帮助` 曾经创建过一个 turn，并让 agent 用 bash 找了十几次。
+所以"命令走后没有 turn"就是命令层接管的硬判据。
+
 ### F7 本机版本
 
 DSH `0.2.1-rc.5`（检查兼容性时用 `includePrerelease`，所以 `0.2.1-rc.x` 满足 `^0.2.1-rc.1`）；`@deepseek-ai/dsh-experimental-auto-review` 分叉自 tag `dsh-v0.2.1-rc.5`。
@@ -375,7 +391,7 @@ DSH `0.2.1-rc.5`（检查兼容性时用 `includePrerelease`，所以 `0.2.1-rc.
 | 两种组合实测（见 F9） | 官方 key + 审查开；opencode + 审查关 |
 | 入站形态全测（见 F1） | 文本 / 卡片 / 短链 / 长链 / 图片 / 文件 / 语音 / 引用 / 转发 / 连发 |
 | 媒体解密链路 | `full_url` → base64(hex) 密钥 → AES-128-ECB，md5 校验 |
-| **命令层 v1**（`#帮助` / `#当前模式` / `#任务状态`、`>` 逃逸、未知命令回帮助） | `src/commands.ts` + `inbound.ts` 的钩子（插在 pending 消费之前）+ `test/commands.mjs`（23 条断言） |
+| **命令层 v1 已上线**（`#帮助` / `#当前模式` / `#任务状态`、`>` 逃逸、未知命令回帮助） | `src/commands.ts` + `inbound.ts` 的钩子（插在 pending 消费之前）+ `test/commands.mjs`（23 条断言）。2026-11-02 00:13 重启后生效 |
 | 采集 / 账本 / 时间线 / relay | **均未实现**（决策已定，见 §2–§4） |
 
 **上游 PR**
