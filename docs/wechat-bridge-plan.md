@@ -41,10 +41,16 @@
 - 专属 agent 的 `cwd = ~/workspace`（当前实测是 `~/.dsh/profiles/desktop`，待改，见 Q1）。
 - AGENTS.md / CLAUDE.md 注入**保留**（`workspaceInstructions` 开着）。
 
-### D5 模型
+### D5 模型：会话拥有
 
-走 **DeepSeek 官方 key**（`deepseek-official/deepseek-flash`，1M 上下文，支持图片），`#模型` 命令可切。
-**不要**让会话落到 `opencode-go`：它的网关缺少 `x-opencode-session` 头时会让审查请求 400（见 F3）。
+**会话自己拥有模型选择**：界面上切换 → 写 `model/selection` → 下一次请求头跟进 → 审查也跟着走。
+插件只在 `config.model` **显式配置**时才钉死（此时 UI 切换无效，属于设计而非 bug）。
+
+不钉时，桥**不得**把"部署默认值快照"安装成常驻覆盖——那会让会话永远路由到 agent 创建时的全局默认，
+而界面显示的是另一个模型（见 F8）。
+
+走 **DeepSeek 官方 key**（`deepseek-official/deepseek-flash`，1M 上下文，支持图片）。
+`opencode-go` 的网关缺少 `x-opencode-session` 头时会让审查请求 400（见 F3）。
 
 ### D6 会话膨胀
 
@@ -241,13 +247,14 @@ v1 不写入工作台，桥自己留 90 天。
 
 结构日志默认写；消息全文只在 debug 开关下写（本机暂不脱敏，开关预留）。
 
-### D41 自动审查的接入方式
+### D41 自动审查：按会话审，不碰档位
 
-不用官方 `auto` 档，**用自己的 `wechat-auto` 档**：
+由 `dsh-auto-review`（官方包的本地分叉）审，**不注册任何 preset**：
 
-- `sandbox: danger-full-access`、`approval: ask`（与官方 auto 相同的旋钮）。
-- 由 `dsh-auto-review`（官方包的本地分叉）审，**不调用 `registerAuto()`**，因此与官方插件可同时安装；两者各管自己的档位。
+- 判据是 `reviewSessions`（会话 id 列表，本部署为 `wechat-main`），不是档位名。
+  于是**不需要在 profile 里新增档位**，其他会话的选择器不受影响，官方 `auto` 档完全留给自己。
 - `replyTools`（`send_wechat_text` / `send_wechat_file`）跳过审查 —— 收件人由插件固定为 owner，不是工具参数。
+- 卸载时不改任何会话的权限旋钮（它本来就没改过）。
 - 官方插件**不卸载**；关/开它只影响 `auto` 档是否存在。
 
 ---
@@ -291,6 +298,15 @@ v1 不写入工作台，桥自己留 90 天。
 ### F6 插件的本地状态
 
 `~/.dsh/clawbot/` 下有 `accounts/`、`openclaw-weixin/accounts/`（游标）、`inbound/`（解密后的入站媒体）、`memory.md`、`mcp-token`、`sessions/wechat-main.json`（会话创建标记）。
+
+### F8 模型路由的真正来源
+
+审核请求的路由取自 **`session.requestHeader()`**（`src/index.ts:372`，再传给 `ctx.llm.stream`）。
+而会话自己的"当前模型"也是从同一处折叠出来的（`model/selection` → `pending`，`request/header` → `lastUsed`，
+`current() = pending ?? lastUsed`）。
+
+所以：界面点选只写 `pending`；**只有真的发出去的那次请求才会推进 `lastUsed` 与请求头**。
+若插件另外安装了 `ModelSelectionRef` 覆盖（旧行为），请求头永远不会推进，审核就一直用旧路由 → 持续 400。
 
 ### F7 本机版本
 

@@ -651,6 +651,15 @@ export class WechatBridge {
   }
 
   private installSelection(agentCtx: Context): void {
+    // >>> local
+    // With nothing pinned in this plugin's settings the SESSION owns its model:
+    // the web picker writes a `model/selection` event and the next request
+    // header follows it. Installing a snapshot of the deployment default here
+    // would shadow that choice for the rest of the conversation's life — the
+    // bot would keep routing to whatever the global default was when the agent
+    // was created, and the UI would show a model that is not being used.
+    if (this.config.model === undefined) return;
+    // <<< local
     if (this.selectionInstalled.has(agentCtx)) return;
     const selection = this.desiredSelection();
     if (!selection) return;
@@ -676,6 +685,10 @@ export class WechatBridge {
    * everything would be worse than a possible bad pin.
    */
   async refreshSelection(): Promise<void> {
+    // >>> local
+    // Nothing pinned: the session owns its model, there is nothing to re-point.
+    if (this.config.model === undefined) return;
+    // <<< local
     const next = this.desiredSelection();
     if (next === undefined) {
       logger.warn("refreshSelection: 既没有插件自己的设置,也读不到全局默认,保持原样");
