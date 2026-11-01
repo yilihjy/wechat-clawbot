@@ -48,6 +48,10 @@ import { sendMessageWeixin } from "./ilink/messaging/send.js";
 import { stripEmoji, stripWechatCodes } from "./emoji.js";
 import { setLogLevel, logger } from "./ilink/util/logger.js";
 import { registerWorkspaceInstructionsFilter } from "./workspace-instructions.js";
+import { ModeStore } from "./modes.js";
+import { RelayService } from "./relay.js";
+import { sendToDshSession } from "./dsh-sessions.js";
+import { listDshSessions } from "./dsh-sessions.js";
 
 /** Stable Cordis plugin name for the clawbot row. */
 export const name = "clawbot";
@@ -234,6 +238,14 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
   const pending = new PendingRegistry();
 
   let bridge: WechatBridge | null = null;
+  // >>> local: relay（D2/D19）
+  /**
+   * Which conversation each WeChat peer talks to. Lives for the plugin's whole
+   * lifetime (not per monitor start), so a reconnect does not lose a `#接管`.
+   */
+  const modes = new ModeStore(path.join(resolveStateDir(), "modes.json"));
+  let relays: RelayService | null = null;
+  // <<< local
   const codexProgress = new CodexProgressStore();
   /** Messages WeChat would not take yet; shared by the bridge and the MCP notify route. */
   const backlog = new Backlog();
@@ -305,6 +317,10 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
   // once for the plugin lifetime; the bridge is looked up per event.
   ctx.on("session/event", (session, event) => {
     bridge?.onSessionEvent(session, event);
+    // >>> local: relay 镜像（D15）
+    // 只看被接管会话的事件：其它会话与这里无关，relay 自己按 sessionId 过滤。
+    relays?.onSessionEvent(String(session.id), event as { type: string; data?: unknown });
+    // <<< local
   });
 
   /** Send a text message back to one WeChat user through the bound account. */
@@ -324,6 +340,56 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
       },
     });
   };
+
+  // >>> local: relay（D2/D15/D18）
+  /**
+   * Send one local file over WeChat, through the same compression and CDN checks
+   * as `send_wechat_file`. Shared by the bridge's kept-file queue and the relay's
+   * long answers, so both paths behave identically.
+   */
+  const sendFileTo = async (
+    to: string,
+    file: { path: string; caption?: string; original?: boolean },
+  ): Promise<Awaited<ReturnType<typeof uploadFileTo>>> => {
+    const bound = currentAccount;
+    if (!bound?.configured) return { ok: false, windowClosed: false, permanent: false, message: "no bound WeChat account" };
+    return uploadFileTo({
+      config,
+      account: bound,
+      to,
+      contextToken: router?.contextTokenFor(to) ?? "",
+      resolved: file.path,
+      bytes: fs.statSync(file.path).size,
+      caption: file.caption,
+      original: file.original,
+    });
+  };
+
+  // 一个回合一条：把被接管会话这一轮的文字聚起来，加 [标题] 前缀发回微信。
+  // 长文走同一条文件通道（sendFileTo），没有账号时就退化成截断（见 relay.ts）。
+  relays = new RelayService({
+    sendText,
+    deliver: async (sessionId, text) => {
+      const sent = await sendToDshSession(ctx, sessionId, text, { kind: "plugin:clawbot-wechat", wake: true });
+      return sent.ok ? { ok: true } : { ok: false, message: sent.message };
+    },
+    sendFile: async (to, name, text) => {
+      const file = path.join(resolveStateDir(), "outbox", name);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, text, { encoding: "utf-8", mode: 0o600 });
+      try {
+        const sent = await sendFileTo(to, { path: file, original: false });
+        if (!sent.ok) throw new Error(sent.message);
+      } finally {
+        try {
+          fs.unlinkSync(file);
+        } catch {
+          // already gone
+        }
+      }
+    },
+  });
+  // <<< local
 
   // Bridge routes for the local MCP server: list/read/drive sessions, and push
   // one WeChat message to the owner. Registered here rather than beside
@@ -397,6 +463,8 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
       calendarHelper,
       alarms,
       // A kept file goes through the same compression and CDN checks as send_wechat_file.
+      // Kept inline (not the shared sendFileTo above) because a regression check
+      // evaluates this exact source slice with only the names it destructures.
       sendFile: async (to, file) => {
         const bound = currentAccount;
         if (!bound?.configured) return { ok: false, windowClosed: false, permanent: false, message: "no bound WeChat account" };
@@ -419,6 +487,8 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
       pending,
       sendText,
       ctx,
+      modes,
+      ...(relays === null ? {} : { relay: relays }),
     });
 
     abort = new AbortController();
@@ -460,6 +530,18 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
         // 现在 installSelection() 已经跑过,路由才是真的,自检结果才可信。
         await boundBridge?.reportVisionReadiness();
         await boundBridge?.reportIdleCompactReadiness();
+        // >>> local: D19 启动校验
+        // 被接管的会话可能已经被删掉了。留着绑定只会让下一条消息投递失败，
+        // 所以启动时核对一遍，失效的直接交还并记一行日志。
+        const listed = await listDshSessions(ctx).catch(() => undefined);
+        if (listed !== undefined) {
+          const alive = new Set(listed.rows.map((row) => row.id));
+          const dropped = modes.pruneMissing((id) => alive.has(id));
+          if (dropped.length > 0) {
+            logger.warn(`modes: 启动校验交还了 ${dropped.length} 个已不存在的接管（${dropped.map((b) => b.sessionId).join(", ")}）`);
+          }
+        }
+        // <<< local
       },
       (err) => logger.warn(`startMonitor: agent warm-up failed: ${String(err)}`),
     );

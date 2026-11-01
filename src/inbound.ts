@@ -21,6 +21,9 @@ import { PendingRegistry } from "./pending.js";
 import { loadContextToken, saveContextToken } from "./state.js";
 import { logger } from "./ilink/util/logger.js";
 import { routeInboundCommand, runCommand, stripEscape, unknownCommandReply } from "./commands.js";
+import { captureReady, captureReceipt, captureUrl, detectCapture } from "./capture.js";
+import type { ModeStore } from "./modes.js";
+import type { RelayService } from "./relay.js";
 
 function isMediaItem(item: MessageItem | undefined): boolean {
   return (
@@ -127,6 +130,8 @@ export class InboundRouter {
   private readonly pending: PendingRegistry;
   private readonly sendText: (to: string, text: string) => Promise<void>;
   private readonly ctx: Context;
+  private readonly modes?: ModeStore;
+  private readonly relay?: RelayService;
 
   constructor(deps: {
     config: ClawbotConfig;
@@ -136,6 +141,10 @@ export class InboundRouter {
     sendText: (to: string, text: string) => Promise<void>;
     /** Root context, for the command layer's session queries. */
     ctx: Context;
+    /** Per-peer mode; absent only in compositions that cannot relay. */
+    modes?: ModeStore;
+    /** Delivers relayed messages and mirrors their answers. */
+    relay?: RelayService;
   }) {
     this.config = deps.config;
     this.account = deps.account;
@@ -143,6 +152,8 @@ export class InboundRouter {
     this.pending = deps.pending;
     this.sendText = deps.sendText;
     this.ctx = deps.ctx;
+    this.modes = deps.modes;
+    this.relay = deps.relay;
   }
 
   /** Whether a sender may talk to the agent. */
@@ -176,22 +187,29 @@ export class InboundRouter {
       } catch {
         // fresh file / stat race: proceed
       }
-      fs.appendFileSync(
-        rawPath,
-        JSON.stringify({
-          t: Date.now(),
-          seq: msg.seq,
-          msgType: msg.message_type,
-          msgId: msg.message_id,
-          clientId: msg.client_id,
-          items: (msg.item_list ?? []).map((i) => ({
-            type: i.type,
-            text: i.text_item?.text ?? null,
-            hasRef: !!i.ref_msg,
-            ref: i.ref_msg ?? null,
-          })),
-        }) + "\n",
-      );
+      // >>> local: 只在 debug 级别落盘（上游 PR #4）
+      // 这个文件存的是每条入站消息的正文（含引用内容），属于诊断材料而不是
+      // 运行时数据：默认部署不该在状态目录里长期积累一份明文聊天记录。
+      // 上面的轮转保持无条件执行，旧的调试文件仍然有界。
+      if (this.config.logLevel === "debug") {
+        fs.appendFileSync(
+          rawPath,
+          JSON.stringify({
+            t: Date.now(),
+            seq: msg.seq,
+            msgType: msg.message_type,
+            msgId: msg.message_id,
+            clientId: msg.client_id,
+            items: (msg.item_list ?? []).map((i) => ({
+              type: i.type,
+              text: i.text_item?.text ?? null,
+              hasRef: !!i.ref_msg,
+              ref: i.ref_msg ?? null,
+            })),
+          }) + "\n",
+        );
+      }
+      // <<< local
     } catch {
       // ignore logging failures
     }
@@ -242,13 +260,30 @@ export class InboundRouter {
       const reply = await runCommand(routed, {
         ctx: this.ctx,
         sessionId: this.config.sessionId,
+        peer: sender,
         ...(this.config.cwd === undefined ? {} : { cwd: this.config.cwd }),
+        ...(this.modes === undefined ? {} : { modes: this.modes }),
+        capture: (url: string) => this.captureOne(url),
+        captureReady: captureReady(this.config),
+        captureBaseUrl: this.config.captureBaseUrl,
       }).catch((err: unknown) => `命令执行失败：${String((err as Error).message ?? err)}`);
       if (reply !== "") await this.sendText(sender, reply).catch(() => {});
       return;
     }
     // `>` 逃逸：剥掉标记，其余原样交给 agent。
     if (routed.kind === "escape") body = stripEscape(body);
+    // <<< local
+
+    // >>> local: 采集快路径（D21–D25）
+    // 链接卡片与裸链接不进 agent：抓页面、进收件箱、回执，几秒内结束。
+    // 位置在 pending 消费之前 —— 这跟命令层同理，一条链接不该被当成审批答复吃掉。
+    // 采集没配置时保持旧行为（链接还是消息），不悄悄吞掉它。
+    const target = detectCapture(plainText);
+    if (target !== null && captureReady(this.config)) {
+      const result = await this.captureOne(target.url);
+      await this.sendText(sender, captureReceipt(result)).catch(() => {});
+      return;
+    }
     // <<< local
 
     // A pending approval/question for this sender wins over a new turn.
@@ -335,8 +370,37 @@ export class InboundRouter {
     // Route into the shared WeChat session (fire-and-forget: the reply is
     // streamed back by the bridge when the turn completes).
     const content = [quotePrefix, body, mediaNote].filter(Boolean).join("\n");
+
+    // >>> local: relay（D2/D15/D18–D20）
+    // 接管中：这条消息进被接管的真实会话，回复由 relay 在 turn/end 时镜像回来。
+    // 位置在媒体与引用处理之后 —— 图片路径与引用前缀对两种模式同样有用。
+    const lookup = this.modes?.lookup(sender) ?? { binding: null, expired: null };
+    if (lookup.binding !== null) {
+      this.modes?.touch(sender);
+      const sent = await this.relay?.relay(sender, lookup.binding, content);
+      if (sent !== undefined && !sent.ok) {
+        // 投递失败（会话没了 / 没有 sessionController）：说清楚，别让消息静默消失。
+        await this.sendText(sender, `接管的目标会话投递失败：${sent.message}\n\n「#交还」回到专属 agent。`).catch(() => {});
+      }
+      return;
+    }
+    if (lookup.expired !== null) {
+      const title = lookup.expired.title.trim() === "" ? lookup.expired.sessionId.slice(0, 8) : lookup.expired.title;
+      await this.sendText(sender, `接管《${title}》因为久没消息已自动交还，这条交给专属 agent。`).catch(() => {});
+    }
+    // <<< local
+
     // firstImagePath 让 bridge 能把图片本身附上,而不只是给一个路径。
     await this.bridge.enqueueMessage(sender, content, firstImagePath);
+  }
+
+  /** Read one URL and file it (the capture fast path, shared with `#入库`). */
+  private async captureOne(url: string) {
+    return captureUrl(url, {
+      enabled: this.config.captureEnabled,
+      baseUrl: this.config.captureBaseUrl,
+      token: this.config.captureToken,
+    });
   }
 
   /** Context token for an outbound message to a sender ("" when unknown). */

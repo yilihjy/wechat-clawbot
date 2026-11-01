@@ -61,7 +61,12 @@
     "test:codex": "npm run build && node --test test/codex-bridge.mjs",
     "clean": "rm -rf lib",
     "test:memory": "npm run build && node test/memory-eval-run.mjs",
-    "test:commands": "node test/commands.mjs"
+    "test:commands": "node test/commands.mjs",
+    "test:capture": "node test/capture.mjs",
+    "test:modes": "node test/modes.mjs",
+    "test:relay": "node test/relay.mjs",
+    "test:monitor": "node test/monitor.mjs",
+    "test:unit": "npm run build && node test/commands.mjs && node test/capture.mjs && node test/modes.mjs && node test/relay.mjs && node test/monitor.mjs"
   },
   "dsh": {
     "bundle": {

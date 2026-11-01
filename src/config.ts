@@ -220,6 +220,20 @@ export interface ClawbotConfig {
    */
   attachImages: boolean;
 
+  /**
+   * File a link sent from WeChat into the workbench capture inbox
+   * (`#入库`, a bare URL, or a shared `[链接]` card). Off by default: without a
+   * token the fast path could only fail, and a bare URL would stop reaching the
+   * agent for no benefit.
+   */
+  captureEnabled: boolean;
+
+  /** Workbench base URL the capture is POSTed to. */
+  captureBaseUrl: string;
+
+  /** Extension token with the `capture` scope (Bearer). Empty disables the path. */
+  captureToken: string;
+
 
   /**
    * Pin the WeChat session to one model, independent of the deployment default.
@@ -284,6 +298,9 @@ export const DEFAULT_CONFIG: ClawbotConfig = {
   compressThresholdBytes: 1024 * 1024,
   noticeMinBytes: 2 * 1024 * 1024,
   attachImages: true,
+  captureEnabled: false,
+  captureBaseUrl: "http://127.0.0.1:4310",
+  captureToken: "",
 };
 
 function asStringArray(value: unknown): string[] {
@@ -378,6 +395,16 @@ export function normalizeConfig(raw?: Partial<ClawbotConfig> | Record<string, un
         : DEFAULT_CONFIG.noticeMinBytes,
     attachImages:
       typeof r.attachImages === "boolean" ? r.attachImages : DEFAULT_CONFIG.attachImages,
+    captureEnabled:
+      typeof r.captureEnabled === "boolean" ? r.captureEnabled : DEFAULT_CONFIG.captureEnabled,
+    captureBaseUrl:
+      typeof r.captureBaseUrl === "string" && r.captureBaseUrl.trim()
+        ? r.captureBaseUrl.trim()
+        : DEFAULT_CONFIG.captureBaseUrl,
+    captureToken:
+      typeof r.captureToken === "string" && r.captureToken.trim()
+        ? r.captureToken.trim()
+        : DEFAULT_CONFIG.captureToken,
     provider: typeof r.provider === "string" && r.provider.trim() ? r.provider.trim() : undefined,
     model: typeof r.model === "string" && r.model.trim() ? r.model.trim() : undefined,
     reasoningEffort:
@@ -417,6 +444,21 @@ export const BaseConfig = Schema.object({
   attachImages: Schema.boolean()
     .default(true)
     .description("模型支持时,把图片直接附给它看(快)。关掉则退回让它用视觉工具读路径(慢,约多 40 秒),仅用于对比排查"),
+  captureEnabled: Schema.boolean()
+    .default(false)
+    .description(
+      "采集快路径:从微信发来的链接(整条链接、微信的链接卡片、或「#入库 链接」)直接存进工作台收件箱,"
+      + "不进 agent、不花 token。需要同时填下面的工作台地址与 token。",
+    ),
+  captureBaseUrl: Schema.string()
+    .default("http://127.0.0.1:4310")
+    .description("工作台地址(采集接口在 /api/v1/extension/captures)"),
+  captureToken: Schema.string()
+    .default("")
+    .description(
+      "工作台的插件 token(Bearer,scope 要含 capture):在网页端「信源 → 浏览器插件」生成配对码,"
+      + "换到 token 后填在这里。它是明文保存在 profile 里的",
+    ),
   stripEmoji: Schema.boolean()
     .default(true)
     .description("发出去的文字里去掉 Unicode emoji(改用微信原生表情代码)"),
@@ -567,6 +609,10 @@ export const HOT_FIELDS = new Set<keyof ClawbotConfig>([
   "reasoningEffort",
   "allowFrom",
   "attachImages",
+  // 采集三个字段都是逐条消息读取的,改完下一条消息就生效（不必重启监听）。
+  "captureEnabled",
+  "captureBaseUrl",
+  "captureToken",
   // 纯读取的开关,下一条消息生效即可,不需要重启。
   "autoMemory",
   "idleCompaction",
