@@ -41,16 +41,17 @@
 - 专属 agent 的 `cwd = ~/workspace`（当前实测是 `~/.dsh/profiles/desktop`，待改，见 Q1）。
 - AGENTS.md / CLAUDE.md 注入**保留**（`workspaceInstructions` 开着）。
 
-### D5 模型：会话拥有
+### D5 模型：桥镜像会话的选择
 
-**会话自己拥有模型选择**：界面上切换 → 写 `model/selection` → 下一次请求头跟进 → 审查也跟着走。
-插件只在 `config.model` **显式配置**时才钉死（此时 UI 切换无效，属于设计而非 bug）。
+会话**自己拥有**模型：界面上切换 → 写 `model/selection` → 桥把这个值镜像进它安装的选择引用
+→ 下一次请求头跟进 → 审查（若开）也随之走同一条路由。
 
-不钉时，桥**不得**把"部署默认值快照"安装成常驻覆盖——那会让会话永远路由到 agent 创建时的全局默认，
-而界面显示的是另一个模型（见 F8）。
+桥仍然安装一个初始值（否则系统提示词的 `{{model}}` 取不到值，整轮直接报错），
+但那个值不再"锁死"：之后每次 `model/selection` 都会覆盖它。
+
+**例外**：`config.model` 显式配置时是钉死的（此时 UI 切换无效，属于设计）。
 
 走 **DeepSeek 官方 key**（`deepseek-official/deepseek-flash`，1M 上下文，支持图片）。
-`opencode-go` 的网关缺少 `x-opencode-session` 头时会让审查请求 400（见 F3）。
 
 ### D6 会话膨胀
 
@@ -247,15 +248,16 @@ v1 不写入工作台，桥自己留 90 天。
 
 结构日志默认写；消息全文只在 debug 开关下写（本机暂不脱敏，开关预留）。
 
-### D41 自动审查：按会话审，不碰档位
+### D41 自动审查：三层门禁
 
 由 `dsh-auto-review`（官方包的本地分叉）审，**不注册任何 preset**：
 
-- 判据是 `reviewSessions`（会话 id 列表，本部署为 `wechat-main`），不是档位名。
-  于是**不需要在 profile 里新增档位**，其他会话的选择器不受影响，官方 `auto` 档完全留给自己。
-- `replyTools`（`send_wechat_text` / `send_wechat_file`）跳过审查 —— 收件人由插件固定为 owner，不是工具参数。
-- 卸载时不改任何会话的权限旋钮（它本来就没改过）。
-- 官方插件**不卸载**；关/开它只影响 `auto` 档是否存在。
+1. **会话**：`reviewSessions`（本部署 `[wechat-main]`）——其他会话零影响；
+2. **档位开关**：`reviewPreset: wechat-auto` —— 权限选择器选中它 = 审查开，换成任何别的档位 = 关；
+3. **provider 闸门**：`reviewProviders: [deepseek-official]` —— 不在名单里的 provider 直接跳过审查
+   （`opencode-go` 的网关要求 `x-opencode-session`，评审请求必 400；fail-closed 会把整个工具层打死）。
+
+`replyTools`（`send_wechat_text` / `send_wechat_file`）跳过审查。卸载时不改任何会话的权限旋钮。
 
 ---
 

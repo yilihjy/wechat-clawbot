@@ -651,15 +651,6 @@ export class WechatBridge {
   }
 
   private installSelection(agentCtx: Context): void {
-    // >>> local
-    // With nothing pinned in this plugin's settings the SESSION owns its model:
-    // the web picker writes a `model/selection` event and the next request
-    // header follows it. Installing a snapshot of the deployment default here
-    // would shadow that choice for the rest of the conversation's life — the
-    // bot would keep routing to whatever the global default was when the agent
-    // was created, and the UI would show a model that is not being used.
-    if (this.config.model === undefined) return;
-    // <<< local
     if (this.selectionInstalled.has(agentCtx)) return;
     const selection = this.desiredSelection();
     if (!selection) return;
@@ -685,10 +676,6 @@ export class WechatBridge {
    * everything would be worse than a possible bad pin.
    */
   async refreshSelection(): Promise<void> {
-    // >>> local
-    // Nothing pinned: the session owns its model, there is nothing to re-point.
-    if (this.config.model === undefined) return;
-    // <<< local
     const next = this.desiredSelection();
     if (next === undefined) {
       logger.warn("refreshSelection: 既没有插件自己的设置,也读不到全局默认,保持原样");
@@ -1457,6 +1444,25 @@ export class WechatBridge {
   onSessionEvent(session: Session, event: SessionEvent): void {
     if (session.id !== this.sessionId) return;
     logger.debug(`sessionEvent: type=${event.type} seq=${event.seq}`);
+    // >>> local
+    // Mirror the session's own model choice instead of pinning a snapshot of the
+    // deployment default: the web picker appends `model/selection`, and letting
+    // that value through is what makes switching a model take effect on the next
+    // request (and the request header — and any reviewer reading it — follows).
+    // `model/selection` is declared by the agent package, not by the session's
+    // own event union, so compare as a plain string.
+    if ((event.type as string) === "model/selection") {
+      const chosen = event.data as unknown as Partial<ModelSelection> | undefined;
+      if (chosen?.provider && chosen.model) {
+        this.selectionRef.current = {
+          provider: chosen.provider,
+          model: chosen.model,
+          ...(chosen.reasoningEffort === undefined ? {} : { reasoningEffort: chosen.reasoningEffort }),
+        };
+        logger.info(`sessionEvent: 会话自己选了模型 → ${chosen.provider}/${chosen.model}（下一轮生效）`);
+      }
+    }
+    // <<< local
     // Turns the worker drives stop the indicator themselves; this covers
     // reminder turns and messages steered into a turn someone else started.
     if (event.type === "assistant/message") {
