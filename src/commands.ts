@@ -17,7 +17,7 @@ import path from "node:path";
 
 import type { Context } from "@deepseek-ai/cordis";
 
-import { captureReceipt, type CaptureResult } from "./capture.js";
+import { captureReceipt, firstUrl, type CaptureResult } from "./capture.js";
 import { listDshSessions, readDshSession, type DshSessionRow } from "./dsh-sessions.js";
 import { describeBinding, remainingText, type ModeStore } from "./modes.js";
 
@@ -215,8 +215,11 @@ async function fileLink(deps: CommandDeps, arg: string): Promise<string> {
     return "采集没配置好：设置里打开 captureEnabled，并填上工作台的 capture token。";
   }
   if (arg === "") return "用法：#入库 <链接>（整条链接，http/https 开头）";
-  if (!/^https?:\/\//u.test(arg)) return "这不像链接。用法：#入库 https://…";
-  const result = await deps.capture(arg);
+  // The argument may have been pasted with a title in front of it, or a sentence
+  // after it — take the first URL rather than insisting the whole thing be one.
+  const url = firstUrl(arg) ?? arg;
+  if (!/^https?:\/\//u.test(url)) return "这不像链接。用法：#入库 https://…";
+  const result = await deps.capture(url);
   if (result.ok) {
     const title = result.title?.trim() || "(没有标题)";
     deps.note?.(

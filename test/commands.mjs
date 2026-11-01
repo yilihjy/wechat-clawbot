@@ -159,6 +159,15 @@ notes.length = 0;
 const captured = await run("#入库 https://mp.weixin.qq.com/s/abc", { capture: async () => filed, captureReady: true });
 check("#入库 files the link", captured.includes("已进收件箱"), captured);
 check("#入库 notes the capture id", notes.length === 1 && notes[0].includes("capture 0f3c2b"), notes.join(" | "));
+// A pasted title or a trailing comment must not stop the URL from being found.
+let sawUrl;
+const withTitle = await run("#入库 标题在前 https://mp.weixin.qq.com/s/Pasted 后面还跟了一句话", {
+  capture: async (u) => { sawUrl = u; return filed; },
+  captureReady: true,
+});
+check("#入库 finds the URL inside the argument", sawUrl === "https://mp.weixin.qq.com/s/Pasted", String(sawUrl));
+check("#入库 still files it", withTitle.includes("已进收件箱"), withTitle);
+
 notes.length = 0;
 await run("#入库 https://example.com/x", { capture: async () => ({ ...filed, ok: false, kind: "fetch", message: "抓不到正文" }), captureReady: true });
 check("a failed capture is not noted", notes.length === 0);
