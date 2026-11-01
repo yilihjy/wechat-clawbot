@@ -510,6 +510,23 @@ export class WechatBridge {
     }
   }
 
+  /**
+   * Record a command that changed something in this session's context, so the
+   * bot is not left guessing afterwards (D29).
+   *
+   * Only write commands are worth a line: a read-only one (asking for status)
+   * leaves nothing behind, and relaying half the story matters — after `#交还`
+   * the model has never seen the conversation it was temporarily replaced by,
+   * and "刚才那个会话里说了什么" would otherwise be answered from nothing.
+   *
+   * Injected, not followed up: it rides along with the next turn. When the agent
+   * is idle that is immediate; while it runs, the host queues it for the next
+   * step or turn.
+   */
+  noteCommand(text: string): void {
+    this.noteSession(text);
+  }
+
   get id(): SessionId {
     return this.sessionId;
   }

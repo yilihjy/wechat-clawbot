@@ -266,6 +266,8 @@ export class InboundRouter {
         capture: (url: string) => this.captureOne(url),
         captureReady: captureReady(this.config),
         captureBaseUrl: this.config.captureBaseUrl,
+        // D29: only commands with a side effect get a line in the agent's context.
+        note: (text: string) => this.bridge.noteCommand(text),
       }).catch((err: unknown) => `命令执行失败：${String((err as Error).message ?? err)}`);
       if (reply !== "") await this.sendText(sender, reply).catch(() => {});
       return;

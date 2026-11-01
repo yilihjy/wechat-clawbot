@@ -117,6 +117,19 @@ export interface CommandDeps {
   readonly peer?: string;
   /** Clock override for tests. */
   readonly now?: () => number;
+  /**
+   * Record a state-changing command in the agent's own session (D29).
+   *
+   * Read-only commands are never noted: they leave nothing behind, and a line
+   * per status check would just be noise in the context.
+   */
+  readonly note?: (text: string) => void;
+}
+
+/** `HH:MM`, for the one-line command record (D29). */
+function clockText(ms: number): string {
+  const d = new Date(ms);
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
 /** `#当前模式` — what this bot currently is. */
@@ -172,6 +185,11 @@ async function takeOver(deps: CommandDeps, arg: string): Promise<string> {
   const row = numbered[index - 1]!;
   const title = titleOf(row);
   const binding = deps.modes.bind(deps.peer, { sessionId: row.id, title });
+  // >>> local: D29 命令注入
+  // 接管之后微信的消息不再进这个会话，所以它必须知道"我去哪了"，
+  // 否则 #交还 回来时会凭空接话。
+  deps.note?.(`[命令] ${clockText((deps.now ?? Date.now)())} #接管 ${index} → 《${title}》接管中；此后的微信消息进了那个会话，我这里看不到。`);
+  // <<< local
   return [
     `已接管 ${index}. ${title}`,
     `id: ${row.id}`,
@@ -187,6 +205,7 @@ function handBack(deps: CommandDeps): string {
   const dropped = deps.modes.release(deps.peer);
   if (dropped === null) return "现在没在接管，消息都给专属 agent。";
   const title = dropped.title.trim() === "" ? dropped.sessionId.slice(0, 8) : dropped.title;
+  deps.note?.(`[命令] ${clockText((deps.now ?? Date.now)())} #交还 → 《${title}》已结束接管，消息回到这里。`);
   return `已交还《${title}》，回到专属 agent。`;
 }
 
@@ -197,7 +216,14 @@ async function fileLink(deps: CommandDeps, arg: string): Promise<string> {
   }
   if (arg === "") return "用法：#入库 <链接>（整条链接，http/https 开头）";
   if (!/^https?:\/\//u.test(arg)) return "这不像链接。用法：#入库 https://…";
-  return captureReceipt(await deps.capture(arg));
+  const result = await deps.capture(arg);
+  if (result.ok) {
+    const title = result.title?.trim() || "(没有标题)";
+    deps.note?.(
+      `[命令] ${clockText((deps.now ?? Date.now)())} #入库 → 已进收件箱《${title}》（capture ${result.id.slice(0, 6).replace(/-/gu, "")}${result.duplicate ? "，本来就有" : ""}）`,
+    );
+  }
+  return captureReceipt(result);
 }
 
 /** `#任务状态` / `#任务状态 N`. */

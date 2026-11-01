@@ -17,9 +17,12 @@ import { fileURLToPath } from "node:url";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, "..");
 
-const { normalizeCommandText, routeInboundCommand, stripEscape, unknownCommandReply, helpText } = await import(
+const { normalizeCommandText, routeInboundCommand, stripEscape, unknownCommandReply, helpText, runCommand } = await import(
   join(ROOT, "lib/commands.js")
 );
+const { ModeStore } = await import(join(ROOT, "lib/modes.js"));
+const { mkdtempSync, rmSync } = await import("node:fs");
+const { tmpdir } = await import("node:os");
 
 let pass = 0;
 const failures = [];
@@ -72,6 +75,89 @@ for (const name of ["#任务状态", "#当前模式", "#帮助"]) {
   check(`help lists ${name}`, help.includes(name));
 }
 check("unknown reply names the command it did not find", unknownCommandReply("#切换").includes("#切换"));
+
+// ---------------------------------------------------------------- handlers (D29 notes)
+
+// A fake host: two sessions, titles included. Only what `listDshSessions` reads.
+const SESSIONS = [
+  { id: "session-alpha", title: "重构导入流程", cwd: "/tmp/alpha", createdAt: 1000, running: true },
+  { id: "session-beta", title: "写周报", cwd: "/tmp/beta", createdAt: 900, running: false },
+];
+const fakeCtx = {
+  agents: { list: () => [] },
+  get: (name) =>
+    name === "sessionQuery"
+      ? {
+          listSessions: async () =>
+            SESSIONS.map((s) => ({ header: { id: s.id, createdAt: s.createdAt, cwd: s.cwd }, live: true, persisted: true })),
+          readTitleSnapshots: async () => SESSIONS.map((s) => ({ status: "fulfilled", value: { title: { title: s.title } } })),
+        }
+      : undefined,
+};
+
+const DIR = mkdtempSync(join(tmpdir(), "clawbot-commands-"));
+const store = new ModeStore(join(DIR, "modes.json"), { now: () => 1000 });
+const notes = [];
+let clock = 1_000_000;
+const deps = (extra = {}) => ({
+  ctx: fakeCtx,
+  sessionId: "wechat-main",
+  peer: "wxid_me",
+  modes: store,
+  now: () => clock,
+  note: (text) => notes.push(text),
+  ...extra,
+});
+const run = async (text, extra = {}) => runCommand(routeInboundCommand(text), deps(extra));
+
+// Read-only commands leave no trace in the agent's context.
+notes.length = 0;
+await run("#帮助");
+await run("#任务状态");
+await run("#当前模式");
+check("read-only commands are not noted", notes.length === 0, notes.join(" | "));
+
+// #接管 binds, numbers like #任务状态, and tells the agent where it went.
+notes.length = 0;
+const took = await run("#接管 1");
+check("#接管 names the conversation", took.includes("重构导入流程"), took);
+check("#接管 reports the remaining window", took.includes("还剩"), took);
+check("#接管 binds the peer", store.lookup("wxid_me").binding?.sessionId === "session-alpha");
+check("#接管 notes one line", notes.length === 1 && notes[0].includes("#接管 1"), notes.join(" | "));
+check("the note says the agent will not see those messages", notes[0].includes("看不到"));
+
+// The mode report follows the binding.
+check("#当前模式 shows the takeover", (await run("#当前模式")).includes("接管中"));
+
+// A number that is not in the list changes nothing and notes nothing.
+notes.length = 0;
+const missing = await run("#接管 99");
+check("#接管 99 is refused", missing.includes("没有第 99 个"), missing);
+check("#接管 99 notes nothing", notes.length === 0);
+
+// #交还 drops the binding and says so, once.
+notes.length = 0;
+const handed = await run("#交还");
+check("#交还 names what it released", handed.includes("重构导入流程"), handed);
+check("#交还 clears the binding", store.lookup("wxid_me").binding === null);
+check("#交还 notes one line", notes.length === 1 && notes[0].includes("#交还"), notes.join(" | "));
+notes.length = 0;
+check("#交还 with nothing bound is a no-op", (await run("#交还")).includes("没在接管") && notes.length === 0);
+
+// #入库 notes only when something was actually filed.
+const filed = { ok: true, id: "0f3c2b1a-1111", title: "标题", chars: 800, duplicate: false, short: false, status: "pending", url: "u" };
+notes.length = 0;
+const captured = await run("#入库 https://mp.weixin.qq.com/s/abc", { capture: async () => filed, captureReady: true });
+check("#入库 files the link", captured.includes("已进收件箱"), captured);
+check("#入库 notes the capture id", notes.length === 1 && notes[0].includes("capture 0f3c2b"), notes.join(" | "));
+notes.length = 0;
+await run("#入库 https://example.com/x", { capture: async () => ({ ...filed, ok: false, kind: "fetch", message: "抓不到正文" }), captureReady: true });
+check("a failed capture is not noted", notes.length === 0);
+notes.length = 0;
+const unready = await run("#入库 https://example.com/x", { capture: async () => filed, captureReady: false });
+check("#入库 without a token explains the config", unready.includes("capture"), unready);
+check("#入库 without a token notes nothing", notes.length === 0);
+rmSync(DIR, { recursive: true, force: true });
 
 console.log(`commands: ${pass} passed, ${failures.length} failed`);
 for (const failure of failures) console.log(`  ✗ ${failure}`);
