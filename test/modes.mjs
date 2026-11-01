@@ -19,7 +19,7 @@ import { fileURLToPath } from "node:url";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, "..");
 
-const { ModeStore, RELAY_TTL_MS, isRelayActive, remainingMs, remainingText, describeBinding } = await import(
+const { ModeStore, RELAY_TTL_MS, isRelayActive, isFresh, remainingMs, remainingText, describeBinding } = await import(
   join(ROOT, "lib/modes.js")
 );
 
@@ -100,6 +100,20 @@ writeFileSync(FILE, JSON.stringify({ version: 1, peers: { wxid_x: { sessionId: "
 const repaired = new ModeStore(FILE, { now });
 check("a binding without a session id is dropped", repaired.lookup("wxid_x").binding === null);
 check("a binding with a bad timestamp is repaired", repaired.lookup("wxid_y").binding?.sessionId === "ok");
+
+// Reverse lookup: which peer is relaying into one conversation (used by approvals).
+store.release("wxid_a");
+store.bind("wxid_phone", { sessionId: "session-target", title: "目标" });
+equal("peerFor finds the peer", store.peerFor("session-target")?.peer, "wxid_phone");
+check("peerFor ignores other conversations", store.peerFor("session-other") === null);
+clock += RELAY_TTL_MS + 1;
+check("peerFor ignores a stale binding", store.peerFor("session-target") === null);
+
+// Freshness is what stops a prompt going to a phone the owner put down.
+const fresh = { sessionId: "s", title: "t", since: 0, lastAt: 1_000_000 };
+check("a just-used binding is fresh", isFresh(fresh, 1_000_000 + 60_000));
+check("a quiet one is not", !isFresh(fresh, 1_000_000 + 5 * 60_000));
+check("the window is adjustable", isFresh(fresh, 1_000_000 + 60_000, 120_000));
 
 // The pure helpers the receipts are built from.
 const binding = { sessionId: "abcdef123456", title: "标题", since: 0, lastAt: 0 };

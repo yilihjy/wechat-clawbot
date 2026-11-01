@@ -12,6 +12,7 @@ import type { ApprovalOutcome, ApprovalRequest } from "@deepseek-ai/dsh-user-app
 import type { ClawbotConfig } from "./config.js";
 import type { WechatBridge } from "./bridge.js";
 import { PendingRegistry } from "./pending.js";
+import { isFresh, type ModeStore, type RelayBinding } from "./modes.js";
 import { logger } from "./ilink/util/logger.js";
 
 // NOTE: no \b word boundaries here — JS \b does not match CJK text, so
@@ -28,11 +29,57 @@ function parseApprovalReply(text: string): "yes" | "no" {
   return "no";
 }
 
+/**
+ * Where one permission request should be asked.
+ *
+ * - `wechat` — the dedicated WeChat session, answered on the phone.
+ * - `relay` — a real conversation that is currently being driven from the phone.
+ * - `no-sender` — ours, but there is nobody to ask (the WeChat session has no
+ *   active sender). Failing closed is deliberate: a phone-owned session must not
+ *   pop a dialog on the desktop.
+ * - `not-ours` — delegate to the next listener (the desktop's own UI).
+ *
+ * A relayed conversation only intercepts the prompt while the phone is actively
+ * using it: after a few minutes of silence the owner is presumably back at the
+ * desktop, and taking the prompt away would strand the turn on the phone.
+ */
+export type ApprovalRoute =
+  | { readonly kind: "wechat"; readonly sender: string }
+  | { readonly kind: "relay"; readonly sender: string; readonly title: string }
+  | { readonly kind: "no-sender" }
+  | { readonly kind: "not-ours" };
+
+/** Decide who answers one approval request. Pure: time and state are passed in. */
+export function approvalRoute(input: {
+  /** Is the requesting agent the WeChat session? */
+  readonly isWechat: boolean;
+  /** The WeChat recipient of the current activity, if any. */
+  readonly activeSender?: string | undefined;
+  /** The peer relaying into this conversation, when there is one. */
+  readonly relay?: { readonly peer: string; readonly binding: RelayBinding } | null;
+  readonly now: number;
+  readonly freshMs?: number;
+}): ApprovalRoute {
+  if (input.isWechat) {
+    return input.activeSender === undefined
+      ? { kind: "no-sender" }
+      : { kind: "wechat", sender: input.activeSender };
+  }
+  const relay = input.relay;
+  if (relay === null || relay === undefined) return { kind: "not-ours" };
+  const fresh = input.freshMs === undefined
+    ? isFresh(relay.binding, input.now)
+    : isFresh(relay.binding, input.now, input.freshMs);
+  if (!fresh) return { kind: "not-ours" };
+  return { kind: "relay", sender: relay.peer, title: relay.binding.title };
+}
+
 export class ApprovalRelay {
   private readonly config: ClawbotConfig;
   private readonly getBridge: () => WechatBridge | null;
   private readonly pending: PendingRegistry;
   private readonly sendText: (to: string, text: string) => Promise<void>;
+  private readonly modes: ModeStore | undefined;
 
   constructor(deps: {
     config: ClawbotConfig;
@@ -40,11 +87,14 @@ export class ApprovalRelay {
     getBridge: () => WechatBridge | null;
     pending: PendingRegistry;
     sendText: (to: string, text: string) => Promise<void>;
+    /** Where the relayed conversations are (absent only in compositions without relay). */
+    modes?: ModeStore;
   }) {
     this.config = deps.config;
     this.getBridge = deps.getBridge;
     this.pending = deps.pending;
     this.sendText = deps.sendText;
+    this.modes = deps.modes;
   }
 
   /** Register the `approval/request` waterfall listener on the root context. */
@@ -59,23 +109,36 @@ export class ApprovalRelay {
     next: () => Promise<ApprovalOutcome>,
   ): Promise<ApprovalOutcome> {
     const bridge = this.getBridge();
-    if (!bridge || !bridge.isWechatSession(req.agent.id)) {
-      return next();
-    }
-    const sender = bridge.activeSender;
-    if (!sender) {
+    if (!bridge) return next();
+    const isWechat = bridge.isWechatSession(req.agent.id);
+    // >>> local: relay 的审批也走微信（D16）
+    const route = approvalRoute({
+      isWechat,
+      ...(bridge.activeSender === undefined ? {} : { activeSender: bridge.activeSender }),
+      relay: isWechat ? null : this.modes?.peerFor(req.agent.id) ?? null,
+      now: Date.now(),
+    });
+    if (route.kind === "not-ours") return next();
+    if (route.kind === "no-sender") {
       logger.warn(`approval: no active WeChat sender for agent ${req.agent.id}; failing closed`);
       return "unavailable";
     }
+    const sender = route.sender;
+    const heading = route.kind === "relay"
+      ? `【DSH 权限请求 · ${route.title.trim() === "" ? "接管中的会话" : `《${route.title}》`}】`
+      : "【DSH 权限请求】";
 
     const question =
-      `【DSH 权限请求】\n` +
+      `${heading}\n` +
       `工具: ${req.toolName}\n` +
       `原因: ${req.reason ?? "(未提供)"}\n` +
       `请回复：同意 / 拒绝`;
+    // <<< local
 
     try {
       await this.sendText(sender, question);
+      // Answering a prompt keeps the relay window open: the owner is on the phone.
+      if (route.kind === "relay") this.modes?.touch(sender);
     } catch (err) {
       logger.error(`approval: failed to send question to ${sender}: ${String(err)}`);
       return "unavailable";

@@ -66,7 +66,8 @@
     "test:modes": "node test/modes.mjs",
     "test:relay": "node test/relay.mjs",
     "test:monitor": "node test/monitor.mjs",
-    "test:unit": "npm run build && node test/commands.mjs && node test/capture.mjs && node test/modes.mjs && node test/relay.mjs && node test/monitor.mjs"
+    "test:approvals": "node test/approvals.mjs",
+    "test:unit": "npm run build && node test/commands.mjs && node test/capture.mjs && node test/modes.mjs && node test/relay.mjs && node test/monitor.mjs && node test/approvals.mjs"
   },
   "dsh": {
     "bundle": {

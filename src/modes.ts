@@ -49,6 +49,20 @@ export function isRelayActive(binding: RelayBinding, now: number, ttlMs: number 
   return now - binding.lastAt < ttlMs;
 }
 
+/**
+ * How recently the phone must have used the binding for it to be treated as
+ * "you are on the phone right now" (the approval relay asks this).
+ *
+ * Without it, an approval would keep going to WeChat for the whole 30-minute
+ * window even after the owner sat back down at the desktop.
+ */
+export const RELAY_FRESH_MS = 5 * 60_000;
+
+/** Was this binding used in the last `windowMs`? */
+export function isFresh(binding: RelayBinding, now: number, windowMs: number = RELAY_FRESH_MS): boolean {
+  return now - binding.lastAt < windowMs;
+}
+
 /** Milliseconds left before the binding lapses (never negative). */
 export function remainingMs(binding: RelayBinding, now: number, ttlMs: number = RELAY_TTL_MS): number {
   return Math.max(0, binding.lastAt + ttlMs - now);
@@ -105,6 +119,24 @@ export class ModeStore {
   /** Every binding, live or stale, for the status text and startup validation. */
   all(): RelayBinding[] {
     return Object.values(this.load());
+  }
+
+  /**
+   * The peer relaying into one conversation, if any.
+   *
+   * Used by the approval relay: a permission request belongs to a session, and
+   * the question has to reach whoever is holding that conversation right now.
+   * Stale bindings are not returned — a relay nobody has used for half an hour
+   * must not intercept a prompt the desktop is about to show.
+   */
+  peerFor(sessionId: string): { peer: string; binding: RelayBinding } | null {
+    const now = this.now();
+    for (const [peer, binding] of Object.entries(this.load())) {
+      if (binding.sessionId !== sessionId) continue;
+      if (!isRelayActive(binding, now, this.ttlMs)) return null;
+      return { peer, binding };
+    }
+    return null;
   }
 
   /** Look one peer up, dropping a binding that has been silent for too long. */

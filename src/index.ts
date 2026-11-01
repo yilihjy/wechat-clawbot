@@ -598,6 +598,7 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
     getBridge: () => bridge,
     pending,
     sendText,
+    modes,
   });
   relay.register(ctx);
 
