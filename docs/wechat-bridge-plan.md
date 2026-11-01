@@ -457,7 +457,10 @@ DSH `0.2.1-rc.5`（检查兼容性时用 `includePrerelease`，所以 `0.2.1-rc.
 - `#3` `feat(config): add a claudePeer switch for the Claude Code tools`（+24/−5，`pr/claude-peer-switch`）；
 - `#4` `fix(inbound): only dump raw inbound messages at debug level`（+24/−16，`pr/inbound-raw-log-switch`）——
   **本分叉已经吃进来**（`inbound.ts` 的 `// >>> local` 块），上游接受后 rebase 会自动去掉；
-- `#5` `fix(config): resolve cwd and make the effective directory visible`（+17/−1，`pr/cwd-validation`）。
+- `#5` `fix(config): resolve cwd and make the effective directory visible`（+17/−1，`pr/cwd-validation`）；
+- `#7` `fix(monitor): save the continuation buffer after the batch, not before`（issue `#6`，分支
+  `fix/sync-buf-after-processing`）—— 就是 D48 那件事的上游版，连已见集合一起提，
+  否则等于把"静默丢消息"换成"重复回复"。
 
 #2 的 19 行本地改动同样已经合进 `main`，若被接受，rebase 后 fork 的源码 diff 会自然归零。
 
@@ -465,8 +468,8 @@ DSH `0.2.1-rc.5`（检查兼容性时用 `includePrerelease`，所以 `0.2.1-rc.
 
 1. `claudePeer` 缺开关 —— **已提**（PR #3）；
 2. 入站原文日志无开关 —— **已提**（PR #4），分叉里也已经吃进来；
-3. 游标先落盘再处理 —— **本地已修**（D48），还差一个 issue + PR。上游那版要连
-   "已见集合" 一起提，否则把至少一次投递换成了重复回复，等于换个坑；
+3. 游标先落盘再处理 —— **本地已修**（D48），**上游已提**（issue `#6` + PR `#7`，
+   连已见集合一起，否则等于把"静默丢消息"换成"重复回复"）；
 4. `approvalTimeoutMs` 默认 0（永不超时）—— 还没动。
 
 ## 6. 未定（讨论中）
