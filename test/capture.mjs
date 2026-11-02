@@ -359,7 +359,13 @@ check("a bare 404 means the workbench has no reject route", missingRoute.ok === 
 check("that message tells the owner what to do instead", missingRoute.message.includes("收件箱"), missingRoute.message);
 
 const missingCapture = await rejectCapture("cap-1234", CONFIG, rejectStub(404, { error: { code: "not_found", message: "no such capture" } }));
-check("a 404 with an error body means the capture is gone", missingCapture.ok === false && missingCapture.kind === "not-found", JSON.stringify(missingCapture));
+check("a specific 404 means the capture is gone", missingCapture.ok === false && missingCapture.kind === "not-found", JSON.stringify(missingCapture));
+
+// The real workbench answers every unknown /api/v1 path with this exact body
+// (measured 2026-11-02 23:59), so it must NOT be read as "no such capture".
+const generic = await rejectCapture("cap-1234", CONFIG, rejectStub(404, { error: { code: "not_found", message: "not found" } }));
+check("the workbench's generic 404 means it cannot reject", generic.ok === false && generic.kind === "not-implemented", JSON.stringify(generic));
+check("and it does not claim the capture is missing", !generic.message.includes("没有这条"), generic.message);
 
 const methodNotAllowed = await rejectCapture("cap-1234", CONFIG, rejectStub(405));
 check("405 also means the route is not there", methodNotAllowed.ok === false && methodNotAllowed.kind === "not-implemented");

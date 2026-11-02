@@ -521,7 +521,14 @@ export async function rejectCapture(
   }
   if (res.ok) return { ok: true, id: captureId, already: body.alreadyRejected === true };
   const detail = body.error?.message ?? (raw === "" ? `HTTP ${res.status}` : raw.slice(0, 120));
-  if (res.status === 404 && body.error?.code !== undefined) {
+  // A workbench without this route answers with its generic API 404, and that body
+  // is byte-for-byte the same as for any other unknown path under /api/v1
+  // (measured: "not found", code not_found). Only a 404 that says something
+  // *specific* means the capture itself is gone — otherwise "no such capture"
+  // would send the owner hunting through an inbox the capture is still sitting in.
+  const generic404 = res.status === 404
+    && (body.error === undefined || body.error.message === undefined || body.error.message === "not found");
+  if (res.status === 404 && !generic404) {
     return { ok: false, kind: "not-found", message: `工作台里没有这条（${detail}）` };
   }
   if (res.status === 404 || res.status === 405) {
