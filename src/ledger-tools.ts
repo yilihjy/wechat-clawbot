@@ -91,13 +91,19 @@ export async function undoEntry(
   return { ok: true, message: `已重新接管《${previous.title.trim() || previous.sessionId.slice(0, 8)}》。` };
 }
 
-/** Append the record that makes an undo visible (and not repeatable). */
-function markUndone(deps: LedgerToolDeps, entry: LedgerEntry, message: string): void {
+/**
+ * Append the record of an undo attempt.
+ *
+ * A successful one also takes its target off the candidate list (see
+ * `CommandLedger.undoable`); a failed one stays visible as a failure and leaves
+ * the target undoable, because the thing it tried to do did not happen.
+ */
+function markUndo(deps: LedgerToolDeps, entry: LedgerEntry, ok: boolean, message: string): void {
   deps.ledger.append(
     {
       command: "撤销",
       args: { target: entry.ts, undone: entry.command },
-      result: "ok",
+      result: ok ? "ok" : "failed",
       summary: message,
       undo: null,
     },
@@ -194,7 +200,7 @@ export function registerLedgerTools(agentCtx: Context, deps: LedgerToolDeps): vo
           }
           const only = candidates[0]!;
           const result = await undoEntry(only, deps);
-          if (result.ok) markUndone(deps, only, `${undoLabel(only.undo!)} · ${result.message}`);
+          markUndo(deps, only, result.ok, result.message);
           logger.info(`undo_command: ${caller} undid ${only.command}@${only.ts}: ${result.message}`);
           return { ok: result.ok, text: result.message };
         }
@@ -205,7 +211,7 @@ export function registerLedgerTools(agentCtx: Context, deps: LedgerToolDeps): vo
         }
         const entry = candidates[index - 1]!;
         const result = await undoEntry(entry, deps);
-        if (result.ok) markUndone(deps, entry, `${undoLabel(entry.undo!)} · ${result.message}`);
+        markUndo(deps, entry, result.ok, result.message);
         logger.info(`undo_command: ${caller} undid #${index} ${entry.command}@${entry.ts}: ${result.message}`);
         return { ok: result.ok, text: result.message };
       },

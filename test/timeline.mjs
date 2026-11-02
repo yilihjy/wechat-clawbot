@@ -64,6 +64,14 @@ check("grouping finds the failure", groups.failed.length === 1 && groups.failed[
 check("grouping finds the duplicate", groups.notable.length === 1);
 check("grouping is newest first inside a section", groups.did[0].ts === at(9));
 
+// A failed undo is a failure of its own, and must not hide what it tried to undo.
+const failedUndo = groupDay([
+  entry({ ts: at(9), command: "采集", summary: "入库《甲》", undo: { kind: "capture", captureId: "c", url: "u", title: "甲" } }),
+  entry({ ts: at(10), command: "撤销", args: { target: at(9) }, result: "failed", summary: "没能撤掉" }),
+]);
+check("a failed undo is listed as a failure", failedUndo.failed.length === 1 && failedUndo.failed[0].command === "撤销");
+check("a failed undo leaves its target in 做了", failedUndo.did.length === 1 && failedUndo.did[0].ts === at(9));
+
 // ---------------------------------------------------------------- the page
 
 const html = renderTimeline({

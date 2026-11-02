@@ -234,6 +234,9 @@ agent 模式没有窗口：那一刻被取消的回合就是这条微信刚开�
 - `undo_command` 无参且只有一条候选 → 直接撤；多条 → 列编号（最多 5 条）并让模型再调一次；
 - 撤销本身也写一条 `command: "撤销"`（`args.target` 指向被撤的那条），
   于是它不会再出现在候选里，时间线上也有痕迹；
+- **撤失败也写**，`result: "failed"`：只有成功的撤销才把目标从候选里拿掉。
+  否则工作台还没开端点的那段时间，"撤一下试试"会把那条采集藏起来，等端点上线反而找不到可撤的了；
+  时间线上它落在「失败」，不是「做了」；
 - `#入库` 的撤销走 `rejectCapture()`：200 幂等（`alreadyRejected`）、409 = 已被 accepted、
   **裸 404 / 405 = 工作台还没有这个端点**（回执说"只能在收件箱里点拒绝"）、
   带 `error` 的 404 = 这条 capture 不存在。两种 404 必须分开说，否则会让人去收件箱里找一个就在那儿的东西；
@@ -572,8 +575,8 @@ DSH `0.2.1-rc.5`（检查兼容性时用 `includePrerelease`，所以 `0.2.1-rc.
 | **relay**（`#接管 N` / `#交还`，30 分钟自动交还，按回合镜像，审批也转发） | `src/modes.ts`（模式持久化）+ `src/relay.ts`（镜像与分段）+ `src/approvals.ts`（按会话路由，5 分钟新鲜度）+ 三个测试文件（86 条断言）。**已加载**（F13 的 `#帮助` 里有 `#接管 N`），但**从没在微信里真跑过一次** |
 | **两个债已修**（游标、入站原文日志） | `src/monitor.ts`（处理完再落盘 + 已见集合）、`src/inbound.ts`（原文日志只在 debug 落盘，即上游 PR #4） |
 | **命令账本**（D28） | `src/ledger.ts` + `test/ledger.mjs`（33 条）。每条命令一行、按日分文件、90 天、坏行跳过并计数 |
-| **撤销**（D30） | `src/ledger-tools.ts`（`command_ledger` / `undo_command`，注册在微信会话上）。`#入库` 的撤销要工作台的 reject 端点——**等 `workbench-capture-reject`**；`#接管`/`#交还` 的撤销已经能用 |
-| **时间线页面 + 日报**（D32/D33） | `src/timeline.ts` + `test/timeline.mjs`（38 条）。`/plugins/clawbot/timeline`，只读、只认本机；打开某一天就顺手写 `state/reports/<day>.md` |
+| **撤销**（D30） | `src/ledger-tools.ts`（`command_ledger` / `undo_command`，注册在微信会话上；`test/undo.mjs` 15 条）。`#入库` 的撤销要工作台的 reject 端点——**等 `workbench-capture-reject`**；`#接管`/`#交还` 的撤销已经能用 |
+| **时间线页面 + 日报**（D32/D33） | `src/timeline.ts` + `test/timeline.mjs`（40 条）。`/plugins/clawbot/timeline`，只读、只认本机；打开某一天就顺手写 `state/reports/<day>.md` |
 | **命令层 v2**（D12/D14 + Q1/Q3） | `#停一下`（接管中二次确认）、`#允许`/`#拒绝`（审批只认这两条）、`#新会话`（用配置的 cwd 新建并接管）、`#模型`/`#模型 N`。`test/commands.mjs` 60 → 97 条、新增 `test/stop.mjs` 25 条 |
 
 **上游 PR**

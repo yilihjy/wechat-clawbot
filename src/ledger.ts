@@ -204,7 +204,10 @@ export class CommandLedger {
     const undone = new Set<number>();
     for (const entry of entries) {
       const target = undoneTarget(entry);
-      if (target !== null) undone.add(target);
+      // Only a 撤销 that worked hides its target: a failed attempt (the workbench
+      // has no reject route yet) must leave the entry on offer, or the retry has
+      // nothing to point at.
+      if (target !== null && entry.result === "ok") undone.add(target);
     }
     return entries
       .filter((entry) => entry.undo !== undefined && entry.undo !== null && !undone.has(entry.ts))

@@ -61,9 +61,11 @@ export function clockOf(ms: number): string {
  */
 export function classify(entry: LedgerEntry, undone: ReadonlySet<number> = new Set()): Section {
   if (undone.has(entry.ts)) return "notable";
-  if (entry.command === "撤销") return "did";
   if (isReadOnlyLook(entry)) return "read";
+  // A failure is a failure whatever the command is — including a 撤销 that the
+  // workbench could not carry out.
   if (entry.result === "failed") return "failed";
+  if (entry.command === "撤销") return "did";
   if (entry.result === "noop") return "notable";
   if (entry.args?.["duplicate"] === true) return "notable";
   if (entry.args?.["short"] === true) return "notable";
@@ -75,7 +77,7 @@ export function groupDay(entries: readonly LedgerEntry[]): Record<Section, Ledge
   const undone = new Set<number>();
   for (const entry of entries) {
     const target = entry.args?.["target"];
-    if (entry.command === "撤销" && typeof target === "number") undone.add(target);
+    if (entry.command === "撤销" && typeof target === "number" && entry.result === "ok") undone.add(target);
   }
   const groups: Record<Section, LedgerEntry[]> = { did: [], failed: [], notable: [], read: [] };
   for (const entry of [...entries].sort((a, b) => b.ts - a.ts)) groups[classify(entry, undone)].push(entry);
@@ -134,7 +136,7 @@ export function renderTimeline(input: {
   const undone = new Set<number>();
   for (const entry of input.entries) {
     const target = entry.args?.["target"];
-    if (entry.command === "撤销" && typeof target === "number") undone.add(target);
+    if (entry.command === "撤销" && typeof target === "number" && entry.result === "ok") undone.add(target);
   }
   const section = (title: string, entries: LedgerEntry[], empty: string): string =>
     `<section><h2>${title} <small>${entries.length}</small></h2>${
