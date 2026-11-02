@@ -29,7 +29,7 @@ const RECENT_LIMIT = 5;
 
 /** One entry of the help table, in the order it is printed. */
 const HELP: ReadonlyArray<readonly [name: string, summary: string]> = [
-  ["#任务状态", "在跑的会话与最近结束的"],
+  ["#任务状态", "在跑的会话与最近活跃的"],
   ["#任务状态 N", "展开第 N 个"],
   ["#当前模式", "我现在的模式、会话与工作区"],
   ["#接管 N", "让第 N 个会话临时变成微信的前端"],
@@ -254,7 +254,7 @@ export async function renderStatus(deps: CommandDeps, arg = ""): Promise<string>
   if (running.length === 0) lines.push("（没有正在跑的）");
   running.forEach((row, i) => lines.push(`${i + 1}. ${describe(row)}`));
 
-  lines.push("", `最近结束 ${recent.length} 个`);
+  lines.push("", `最近活跃 ${recent.length} 个`);
   if (recent.length === 0) lines.push("（没有）");
   recent.forEach((row, i) => lines.push(`${running.length + i + 1}. ${describe(row)}`));
 
