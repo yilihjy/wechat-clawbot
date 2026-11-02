@@ -85,6 +85,39 @@ for (const name of ["#任务状态", "#接管 N", "#交还", "#入库"]) {
 }
 check("the prompt says command messages never reach the agent", guidance.includes("到不了你这里"));
 
+// ---------------------------------------------------------------- activity ordering
+
+// A fake controller: the web sidebar's summaries, already activity-ordered.
+const CONTROLLER_ITEMS = [
+  { sessionId: "wechat-main", updatedAt: 9_000, running: false, blank: false, cwd: "/tmp/w" },
+  { sessionId: "s-old-but-active", updatedAt: 8_000, running: true, blank: false, cwd: "/tmp/g", projections: { values: { title: "打通微信和DSH" } } },
+  { sessionId: "s-newer-created", updatedAt: 3_000, running: false, blank: false, cwd: "/tmp/g", projections: { values: { title: "创建更晚但早就不用了" } } },
+  { sessionId: "s-blank", updatedAt: 7_500, running: false, blank: true, cwd: "/tmp/g" },
+  { sessionId: "s-subagent", updatedAt: 6_000, running: false, blank: false, origin: "subagent", projections: { values: { title: "子代理" } } },
+];
+const controllerCtx = {
+  agents: { list: () => [] },
+  get: (name) => (name === "sessionController" ? { resolveAgent: async () => ({}), list: async () => ({ items: CONTROLLER_ITEMS }) } : undefined),
+};
+const { renderStatus } = await import(join(ROOT, "lib/commands.js"));
+const status = await renderStatus({ ctx: controllerCtx, sessionId: "wechat-main" });
+check("the running conversation comes first", /1\. 打通微信和DSH/u.test(status), status);
+check("a newer-but-idle conversation is ordered by activity, not creation", status.indexOf("创建更晚") > status.indexOf("打通微信和DSH"), status);
+check("the WeChat session itself is never listed", !status.includes("wechat-main"));
+check("blank sessions are hidden", !status.includes("s-blank"));
+check("subagent sessions are hidden", !status.includes("子代理"), status);
+check("the list counts what it shows", status.includes("共 2 个会话"), status);
+
+// Relative stamps: what makes "used just now" visible on a phone.
+const { relativeStamp } = await import(join(ROOT, "lib/commands.js"));
+const NOW = new Date("2026-11-02T22:30:00").getTime();
+check("just now", relativeStamp(NOW - 5_000, NOW) === "刚刚");
+check("minutes", relativeStamp(NOW - 7 * 60_000, NOW) === "7 分钟前");
+check("today", relativeStamp(new Date("2026-11-02T09:05:00").getTime(), NOW) === "今天 09:05");
+check("yesterday", relativeStamp(new Date("2026-11-01T21:04:00").getTime(), NOW) === "昨天 21:04");
+check("older years carry the year", relativeStamp(new Date("2025-12-31T08:00:00").getTime(), NOW).startsWith("2025-12-31"));
+check("an unknown time is silent", relativeStamp(0, NOW) === "");
+
 // ---------------------------------------------------------------- handlers (D29 notes)
 
 // A fake host: two sessions, titles included. Only what `listDshSessions` reads.

@@ -43,9 +43,28 @@ export type SessionQueryLike = {
   }>;
 };
 
-/** The part of the host's `sessionController` service used to wake a session. */
+/** One row of `sessionController.list()` — the same summaries the web sidebar sorts by. */
+type ControllerSummary = {
+  sessionId: string;
+  /** Last prompt time, floored at the creation time (`lastPromptAt` in the host). */
+  updatedAt: number;
+  running: boolean;
+  /** Created and never used: not a conversation yet. */
+  blank: boolean;
+  cwd?: string;
+  origin?: "subagent";
+  projections?: { values?: Record<string, unknown> };
+};
+
+/** The part of the host's `sessionController` service this plugin uses. */
 type SessionControllerLike = {
   resolveAgent: (sessionId: unknown) => Promise<{ agent: LiveAgent } | { error: unknown }>;
+  /**
+   * Every visible session, ordered by activity, with the title already folded
+   * into its projection. Optional: a build without the web/app layer need not
+   * have it, and the caller falls back to `sessionQuery`.
+   */
+  list?: (request: unknown, signal: AbortSignal) => Promise<{ items: ControllerSummary[] }>;
 };
 
 type LiveAgent = {
@@ -80,13 +99,36 @@ export type DshSessionRow = {
   id: string;
   title?: string;
   cwd?: string;
+  /** Creation time; 0 when the host only reported activity (see `updatedAt`). */
   createdAt: number;
+  /**
+   * Last activity — the user's last prompt, floored at creation. This is what
+   * "which conversation did I touch last" means, and the only sensible order
+   * for a list a human reads on a phone (a five-day-old conversation that is
+   * being used right now belongs at the top, not off the end).
+   */
+  updatedAt?: number;
   /** Resumed into memory. */
   live: boolean;
   persisted: boolean;
   /** A turn is executing right now. */
   running: boolean;
+  /** Created and never used: hidden from the overview. */
+  blank?: boolean;
+  /** A subagent's own session, not a conversation: hidden. */
+  subagent?: boolean;
 };
+
+/** The order a list of conversations should be in: most recently active first. */
+export function activityOf(row: DshSessionRow): number {
+  return row.updatedAt ?? row.createdAt;
+}
+
+/** The title projection's view is a plain string (or null) — see session-title. */
+function titleOfProjection(summary: ControllerSummary): string | undefined {
+  const value = summary.projections?.values?.title;
+  return typeof value === "string" && value.trim() !== "" ? value.trim() : undefined;
+}
 
 function sessionQuery(ctx: Context): SessionQueryLike | undefined {
   try {
@@ -104,10 +146,48 @@ function sessionController(ctx: Context): SessionControllerLike | undefined {
   }
 }
 
-/** Every DSH session the host knows, with titles; `degraded` when only live agents could be seen. */
+/**
+ * Every DSH session the host knows, with titles; `degraded` when only live
+ * agents could be seen.
+ *
+ * The preferred source is `sessionController.list()`: the same summaries the web
+ * sidebar renders, already ordered by **activity** (`max(createdAt, lastPrompt)`)
+ * and already carrying the folded title in its projection. That matters for two
+ * reasons a phone notices: a conversation created five days ago but used a
+ * minute ago belongs at the top, and folding titles with `readTitleSnapshots`
+ * costs a full log pass per session (measured: ~20 s for 65 sessions, which is
+ * how a status command should never feel).
+ *
+ * `sessionQuery` stays as the fallback for a composition without the web layer;
+ * it can only report creation time, so ordering there is by creation.
+ */
 export async function listDshSessions(
   ctx: Context,
 ): Promise<{ rows: DshSessionRow[]; degraded?: string }> {
+  const controller = sessionController(ctx);
+  if (controller?.list !== undefined) {
+    try {
+      const { items } = await controller.list({}, new AbortController().signal);
+      return {
+        rows: items.map((item) => ({
+          id: item.sessionId,
+          ...(titleOfProjection(item) === undefined ? {} : { title: titleOfProjection(item)! }),
+          ...(item.cwd === undefined ? {} : { cwd: item.cwd }),
+          // The controller reports only activity; keep 0 so nothing renders a
+          // "created at" that is really a "last used at".
+          createdAt: 0,
+          updatedAt: item.updatedAt,
+          live: item.running || !item.blank,
+          persisted: true,
+          running: item.running,
+          blank: item.blank,
+          ...(item.origin === "subagent" ? { subagent: true } : {}),
+        })),
+      };
+    } catch (err) {
+      logger.warn(`dsh sessions: sessionController.list failed, falling back: ${String(err).slice(0, 120)}`);
+    }
+  }
   const live = new Map<string, ReturnType<typeof ctx.agents.list>[number]>(
     ctx.agents.list().map((a) => [String(a.session.id), a]),
   );
@@ -145,6 +225,7 @@ export async function listDshSessions(
         ...(title === undefined || title === "" ? {} : { title }),
         ...(record.header.cwd === undefined ? {} : { cwd: record.header.cwd }),
         createdAt: record.header.createdAt,
+        updatedAt: record.header.createdAt,
         live: record.live,
         persisted: record.persisted,
         running: live.get(record.header.id)?.status === "running",
@@ -257,13 +338,13 @@ function stamp(ms: number): string {
 function describeRow(row: DshSessionRow): string {
   const where = folder(row.cwd);
   return `• ${row.title ?? "(没有标题)"} — ${row.id.slice(0, 8)}`
-    + `${where === "" ? "" : ` · ${where}`} · 创建于 ${stamp(row.createdAt)} · ${stateLabel(row)}`;
+    + `${where === "" ? "" : ` · ${where}`} · 活跃于 ${stamp(activityOf(row))} · ${stateLabel(row)}`;
 }
 
 /** Newest activity first: running, then open, then by creation time. */
 function ordered(rows: readonly DshSessionRow[]): DshSessionRow[] {
   const rank = (r: DshSessionRow) => (r.running ? 2 : r.live ? 1 : 0);
-  return [...rows].sort((a, b) => rank(b) - rank(a) || b.createdAt - a.createdAt);
+  return [...rows].sort((a, b) => rank(b) - rank(a) || activityOf(b) - activityOf(a));
 }
 
 /**

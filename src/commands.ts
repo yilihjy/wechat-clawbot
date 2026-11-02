@@ -18,7 +18,7 @@ import path from "node:path";
 import type { Context } from "@deepseek-ai/cordis";
 
 import { captureReceipt, firstUrl, type CaptureResult } from "./capture.js";
-import { listDshSessions, readDshSession, type DshSessionRow } from "./dsh-sessions.js";
+import { activityOf, listDshSessions, readDshSession, type DshSessionRow } from "./dsh-sessions.js";
 import { describeBinding, remainingText, type ModeStore } from "./modes.js";
 
 /** Trailing punctuation that a phone keyboard adds and a command must ignore. */
@@ -234,11 +234,11 @@ export async function renderStatus(deps: CommandDeps, arg = ""): Promise<string>
   const listed = await listDshSessions(deps.ctx).catch(() => undefined);
   if (listed === undefined) return "读不到会话列表（宿主没有 sessionQuery 服务）。";
 
-  const rows = listed.rows.filter((row) => row.id !== deps.sessionId);
-  const running = rows.filter((row) => row.running).sort((a, b) => b.createdAt - a.createdAt);
+  const rows = listed.rows.filter((row) => row.id !== deps.sessionId && !row.blank && !row.subagent);
+  const running = rows.filter((row) => row.running).sort((a, b) => activityOf(b) - activityOf(a));
   const recent = rows
     .filter((row) => !row.running)
-    .sort((a, b) => b.createdAt - a.createdAt)
+    .sort((a, b) => activityOf(b) - activityOf(a))
     .slice(0, RECENT_LIMIT);
   const numbered = [...running, ...recent];
 
@@ -267,11 +267,11 @@ export async function renderStatus(deps: CommandDeps, arg = ""): Promise<string>
 async function numberedSessions(deps: CommandDeps): Promise<DshSessionRow[] | undefined> {
   const listed = await listDshSessions(deps.ctx).catch(() => undefined);
   if (listed === undefined) return undefined;
-  const rows = listed.rows.filter((row) => row.id !== deps.sessionId);
-  const running = rows.filter((row) => row.running).sort((a, b) => b.createdAt - a.createdAt);
+  const rows = listed.rows.filter((row) => row.id !== deps.sessionId && !row.blank && !row.subagent);
+  const running = rows.filter((row) => row.running).sort((a, b) => activityOf(b) - activityOf(a));
   const recent = rows
     .filter((row) => !row.running)
-    .sort((a, b) => b.createdAt - a.createdAt)
+    .sort((a, b) => activityOf(b) - activityOf(a))
     .slice(0, RECENT_LIMIT);
   return [...running, ...recent];
 }
@@ -282,12 +282,38 @@ function titleOf(row: DshSessionRow): string {
   return title === undefined || title === "" ? row.id.slice(0, 8) : title;
 }
 
-/** One line for the overview: title, workspace, and when it started. */
+/**
+ * How long ago, in the words a phone expects.
+ *
+ * "刚刚" and "3 分钟前" are what make an activity-ordered list legible: a
+ * bare `17:04` reads as today when it may be five days old, which is exactly
+ * how a conversation that is being used right now looks absent.
+ */
+export function relativeStamp(ms: number, now: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return "";
+  const delta = now - ms;
+  if (delta < 60_000) return "刚刚";
+  if (delta < 3_600_000) return `${Math.floor(delta / 60_000)} 分钟前`;
+  const then = new Date(ms);
+  const today = new Date(now);
+  const stamp = clock(ms);
+  if (then.toDateString() === today.toDateString()) return `今天 ${stamp}`;
+  const yesterday = new Date(now);
+  yesterday.setDate(yesterday.getDate() - 1);
+  if (then.toDateString() === yesterday.toDateString()) return `昨天 ${stamp}`;
+  const month = String(then.getMonth() + 1).padStart(2, "0");
+  const day = String(then.getDate()).padStart(2, "0");
+  const year = then.getFullYear() === today.getFullYear() ? "" : `${then.getFullYear()}-`;
+  return `${year}${month}-${day} ${stamp}`;
+}
+
+/** One line for the overview: title, workspace, and when it was last used. */
 function describe(row: DshSessionRow): string {
   const where = row.cwd === undefined ? "" : ` · ${path.basename(row.cwd)}`;
-  const when = Number.isFinite(row.createdAt) ? ` · 自 ${clock(row.createdAt)}` : "";
+  const when = relativeStamp(activityOf(row), Date.now());
+  const stamp = when === "" ? "" : ` · ${when}`;
   const live = row.running ? "（在跑）" : "";
-  return `${titleOf(row)}${where}${when}${live}`;
+  return `${titleOf(row)}${where}${stamp}${live}`;
 }
 
 /** `#任务状态 N` — the session's last few messages. */
