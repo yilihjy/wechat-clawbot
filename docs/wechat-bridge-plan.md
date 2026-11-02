@@ -439,6 +439,26 @@ inbound-raw.jsonl     00:14:16 seq=52 text='#帮助'
 也就是说：公众号文章在**服务端**就能抓（不需要浏览器），手机 UA 足够；
 `chksm` 那类参数必须丢掉，否则同一篇文章会被当成新链接。
 
+### F14 采集对着真工作台跑了一次（2026-11-02 22:59）
+
+配对码由浏览器从工作台「信源 → 浏览器插件」生成，换成 token 后直接用
+`captureUrl` 打**真的** `http://127.0.0.1:4310`：
+
+```
+POST /api/v1/extension/captures  → 201，capture 8253605c-…，status=pending
+回执   已进收件箱：《(没有标题)》 · 38 字 · 825360，正文偏短，可能抓到的是验证页
+```
+
+两件事同时被证明：
+1. **契约是对的**——token、multipart、payload 字段、pending 语义，工作台都收了；
+2. **公众号会拦**——同一条链接隔一段时间再抓，会被 302 到
+   `mp.weixin.qq.com/mp/wappoc_appmsgcaptcha?poc_token=…&target_url=…`，返回 **200**、
+   38 个字、没有标题。旧代码会把这个壳当正文入库（一条垃圾数据，而且链接就丢了）。
+
+所以加了 `isVerificationShell()`（最终 URL 里的 captcha/verify 路径，或头部的「环境异常 /
+完成验证后即可继续访问」），在抽取之前拒绝，回执说「公众号要求先验证，等一下再试」。
+D25 本来就是这么规定的：抓不到的页面不建条目。那条测试数据事后在收件箱里「拒绝」掉了。
+
 ### F13 重启后的实测（2026-11-02 21:56 重启，22:03 两条命令）
 
 机器重启 → DSH 21:56 拉起（PID 1391）。22:03 用户在微信里发了 `#帮助` 和 `#任务状态`。
@@ -489,7 +509,7 @@ DSH `0.2.1-rc.5`（检查兼容性时用 `includePrerelease`，所以 `0.2.1-rc.
 | 入站形态全测（见 F1） | 文本 / 卡片 / 短链 / 长链 / 图片 / 文件 / 语音 / 引用 / 转发 / 连发 |
 | 媒体解密链路 | `full_url` → base64(hex) 密钥 → AES-128-ECB，md5 校验 |
 | **命令层 v1 已上线**（`#帮助` / `#当前模式` / `#任务状态`、`>` 逃逸、未知命令回帮助） | `src/commands.ts` + `inbound.ts` 的钩子（插在 pending 消费之前）+ `test/commands.mjs`（46 条断言，含写命令的注入与提示词里的命令名）。2026-11-02 00:13 重启后生效 |
-| **采集快路径**（`#入库` / 裸链接 / `[链接]` 卡片；token 是配置项） | `src/capture.ts` + `test/capture.mjs`（71 条断言）；配置 `captureEnabled` / `captureBaseUrl` / `captureToken`（三个都是热字段）。**未上线**，等重启 |
+| **采集快路径**（`#入库` / 裸链接 / `[链接]` 卡片；token 是配置项） | `src/capture.ts` + `test/capture.mjs`（75 条断言）；配置 `captureEnabled` / `captureBaseUrl` / `captureToken`（三个都是热字段）。**token 已配对并写入 profile**（站点 blog，90 天，2027-01-31 到期），重启后上线；真工作台已收下过一次采集（F14） |
 | **relay**（`#接管 N` / `#交还`，30 分钟自动交还，按回合镜像，审批也转发） | `src/modes.ts`（模式持久化）+ `src/relay.ts`（镜像与分段）+ `src/approvals.ts`（按会话路由，5 分钟新鲜度）+ 三个测试文件（86 条断言）。**未上线**，等重启 |
 | **两个债已修**（游标、入站原文日志） | `src/monitor.ts`（处理完再落盘 + 已见集合）、`src/inbound.ts`（原文日志只在 debug 落盘，即上游 PR #4） |
 | 账本 / 时间线 / 日报 | **未实现**（决策已定，见 §3） |
@@ -566,11 +586,15 @@ DSH `0.2.1-rc.5`（检查兼容性时用 `includePrerelease`，所以 `0.2.1-rc.
 4. 发 `#交还`，再发一句话，应该回到专属 agent；
 5. 采集要先把 token 填进设置（下一条）。
 
-### 采集上线前要做的一件事
+### 采集：token 已配好（2026-11-02 23:00）
 
-`captureToken` 现在还是空。工作台页面「信源 → 浏览器插件」生成配对码 → 换 token →
-填进 `clawbot` 那一行的 `captureToken`（`captureBaseUrl` 默认 `http://127.0.0.1:4310`，
-`captureEnabled` 打开）。三个字段都是热字段，填完下一条消息就生效，不用再重启。
+`captureToken` 已写进 `~/.dsh/profiles/desktop/cordis.patch.yml` 的 `clawbot` 行
+（`captureEnabled: true`、`captureBaseUrl: http://127.0.0.1:4310`），旧文件备份在
+`cordis.patch.yml.bak-capture-*`。token 绑站点 **blog**、90 天有效（2027-01-31）。
+
+**实测：改这个文件不会热加载**——先把 MCP 的 `calls` 计数打到 1，再 touch 配置文件，
+计数没有归零（插件没重启）。所以：改文件要重启；设置卡片那条路径没验过
+（GUI 的启动 URL 带一次性 token，我没拿到）。
 
 **现在不做**：时间线页面、日报、命令账本与撤销。
 它们要么"用久了才需要"，要么依赖别的东西（撤销要工作台先开一个 extension 侧的 reject 端点）。
