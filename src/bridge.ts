@@ -24,6 +24,9 @@ import { zonedStamp } from "./localtime.js";
 import { compressForUpload } from "./image-compress.js";
 import { registerClaudePeerTools } from "./claude-peer.js";
 import { registerDshSessionTools } from "./dsh-sessions.js";
+import { registerLedgerTools } from "./ledger-tools.js";
+import type { CommandLedger } from "./ledger.js";
+import type { ModeStore } from "./modes.js";
 import { NOTIFY_TOOL } from "./owner-notify.js";
 import { registerCodexPeerTools, type CodexPeer } from "./codex-peer.js";
 import { registerCalendarTools, type CalendarHelper, type OwnerAnswer } from "./mac-calendar.js";
@@ -94,6 +97,10 @@ export type BridgeDeps = {
   sendFile?: (to: string, file: { path: string; caption?: string; original?: boolean }) => Promise<FileUploadResult>;
   /** The macOS Calendar helper; the tools are registered only when `macCalendar` is on. */
   calendarHelper?: CalendarHelper;
+  /** The command ledger (D28): read from it, and undo what it recorded (D30). */
+  ledger?: CommandLedger;
+  /** Relay bindings, for undoing `#接管` / `#交还`. */
+  modes?: ModeStore;
   /** Alarms (urgent reminders), registered with the calendar tools: both are 全天候秘书. */
   alarms?: AlarmService;
 };
@@ -1695,6 +1702,19 @@ export class WechatBridge {
       registerClaudePeerTools(agentCtx, this.config);
       // The same for the owner's other DSH conversations, in any folder.
       registerDshSessionTools(agentCtx, this.ctx, this.config.sessionId);
+      // What was typed on the phone, and how to take one thing back (D28/D30).
+      // Registered here and not globally: the ledger is about this conversation.
+      if (this.deps.ledger !== undefined) {
+        registerLedgerTools(agentCtx, {
+          ledger: this.deps.ledger,
+          ...(this.deps.modes === undefined ? {} : { modes: this.deps.modes }),
+          capture: {
+            enabled: this.config.captureEnabled,
+            baseUrl: this.config.captureBaseUrl,
+            token: this.config.captureToken,
+          },
+        });
+      }
       // Codex tools only when the owner switched them on: every registered tool
       // rides along on every request. codexPeer is a cold field, so a flip
       // restarts the listener and lands here again with the new value.

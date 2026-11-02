@@ -30,6 +30,19 @@ function parseApprovalReply(text: string): "yes" | "no" {
 }
 
 /**
+ * Does this message look like someone answering an approval, only without the
+ * `#`? (D12)
+ *
+ * Used for a nudge, never for an answer: a bare "同意" that reached the agent
+ * would be a message the user did not mean to send, while dropping it silently
+ * would leave them staring at a question they think they answered.
+ */
+export function looksLikeApprovalWord(text: string): boolean {
+  const trimmed = text.trim().replace(/[\s，。！!？?,.、；;：:]+$/g, "");
+  return YES_RE.test(trimmed) || NO_RE.test(trimmed);
+}
+
+/**
  * Where one permission request should be asked.
  *
  * - `wechat` — the dedicated WeChat session, answered on the phone.
@@ -132,7 +145,7 @@ export class ApprovalRelay {
       `${heading}\n` +
       `工具: ${req.toolName}\n` +
       `原因: ${req.reason ?? "(未提供)"}\n` +
-      `请回复：同意 / 拒绝`;
+      `请回复：#允许 / #拒绝`;
     // <<< local
 
     try {

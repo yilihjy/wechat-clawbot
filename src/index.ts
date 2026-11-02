@@ -49,6 +49,9 @@ import { stripEmoji, stripWechatCodes } from "./emoji.js";
 import { setLogLevel, logger } from "./ilink/util/logger.js";
 import { registerWorkspaceInstructionsFilter } from "./workspace-instructions.js";
 import { ModeStore } from "./modes.js";
+import { CommandLedger } from "./ledger.js";
+import { StopConfirms } from "./stop.js";
+import { registerTimelineRoute } from "./timeline.js";
 import { RelayService } from "./relay.js";
 import { sendToDshSession } from "./dsh-sessions.js";
 import { listDshSessions } from "./dsh-sessions.js";
@@ -246,6 +249,15 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
   const modes = new ModeStore(path.join(resolveStateDir(), "modes.json"));
   let relays: RelayService | null = null;
   // <<< local
+  // >>> local: 账本与「停」的确认（D28/D14）
+  /**
+   * One line per command, one file per day. Lives as long as the plugin: a
+   * reconnect of the monitor must not start a second ledger over the same files.
+   */
+  const ledger = new CommandLedger({ dir: path.join(resolveStateDir(), "ledger") });
+  /** `#停一下` in relay mode asks once; this remembers the question (D14). */
+  const stops = new StopConfirms();
+  // <<< local
   const codexProgress = new CodexProgressStore();
   /** Messages WeChat would not take yet; shared by the bridge and the MCP notify route. */
   const backlog = new Backlog();
@@ -397,6 +409,9 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
   // both defined just above.
   registerMcpRoutes(ctx, { config, sendText, getAccount: () => currentAccount, codexProgress, backlog });
 
+  // The timeline page and the day's report (D32/D33). Loopback only, read-only.
+  registerTimelineRoute(ctx, { ledger, reportsDir: path.join(resolveStateDir(), "reports") });
+
   // notify_wechat for every other DSH conversation, in every working directory:
   // registered on the root context, so it is global (owner-notify.ts). The
   // WeChat conversation hides it (bridge.ts restrictTools) and the tool refuses
@@ -462,6 +477,8 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
       backlog,
       calendarHelper,
       alarms,
+      ledger,
+      modes,
       // A kept file goes through the same compression and CDN checks as send_wechat_file.
       // Kept inline (not the shared sendFileTo above) because a regression check
       // evaluates this exact source slice with only the names it destructures.
@@ -488,6 +505,8 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
       sendText,
       ctx,
       modes,
+      ledger,
+      stop: stops,
       ...(relays === null ? {} : { relay: relays }),
     });
 

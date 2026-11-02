@@ -139,6 +139,27 @@ function harness({ timeoutMs, sender = "wxid_me" }) {
 }
 const request = (signal) => ({ agent: { id: "a1" }, toolName: "bash", reason: "计时", signal });
 
+// D12: the prompt has to name the commands, because those are the only answers
+// the bridge takes now.
+{
+  const { pending, sent, relay } = harness({ timeoutMs: 50 });
+  const outcome = relay.answer(request(new AbortController().signal), async () => "allowed-once");
+  await sleep(5);
+  check("the question asks for #允许 / #拒绝", sent[0]?.includes("#允许") && sent[0]?.includes("#拒绝"), sent[0]);
+  pending.popFor("wxid_me")?.resolve("拒绝");
+  equal("a rejection still lands as rejected", await outcome, "rejected");
+}
+
+{
+  const { looksLikeApprovalWord } = await import(join(ROOT, "lib/approvals.js"));
+  for (const word of ["同意", "同意。", "拒绝", "允许", "批准", "yes", "no", "OK"]) {
+    check(`${JSON.stringify(word)} looks like an answer`, looksLikeApprovalWord(word));
+  }
+  for (const word of ["", "同意了", "不要同意", "先别急", "帮我看看这个"]) {
+    check(`${JSON.stringify(word)} is not an answer`, !looksLikeApprovalWord(word));
+  }
+}
+
 // Nobody answers: the card is withdrawn and the phone is told why.
 {
   const { pending, sent, relay } = harness({ timeoutMs: 20 });

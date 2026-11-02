@@ -3210,8 +3210,8 @@ function check(name, ok, detail) {
       const harness = new Function("deps", `
         let { ctx, config, sendText, codexPeer, pending, backlog, calendarHelper, alarms, uploadFileTo, fs,
               pickAccount, WechatBridge, InboundRouter, runMonitor, logger, carryOverLegacyReminders,
-              // >>> local: startMonitor 现在还会把 relay/modes 交给 InboundRouter
-              modes, relays } = deps;
+              // >>> local: startMonitor 现在还会把 relay/modes/账本交给 InboundRouter 与 bridge
+              modes, relays, ledger, stops } = deps;
         let bridge = null, router = null, monitorTask = null, currentAccount = null, warmSession, abort = new AbortController();
         ${monitorCode}
         const restart = (hot) => {
@@ -3240,8 +3240,8 @@ function check(name, ok, detail) {
           uploadFileTo: async () => ({}), fs: {}, pickAccount: () => ({ accountId: "acct", configured: true, userId: "owner" }),
           WechatBridge: FakeBridge, InboundRouter: class { handle() {} }, runMonitor,
           logger: { info() {}, warn() {}, error() {} }, carryOverLegacyReminders() {},
-          // 假的路由器不看这两个,传占位即可。
-          modes: { lookup: () => ({ binding: null, expired: null }) }, relays: null,
+          // 假的路由器不看这几个,传占位即可。
+          modes: { lookup: () => ({ binding: null, expired: null }) }, relays: null, ledger: {}, stops: {},
         });
         hh.startMonitor();
         config.macCalendar = false;

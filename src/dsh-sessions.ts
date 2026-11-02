@@ -56,6 +56,30 @@ type ControllerSummary = {
   projections?: { values?: Record<string, unknown> };
 };
 
+/** One routable model, as the host's catalogue reports it. */
+export type CatalogModel = {
+  readonly id: string;
+  readonly name?: string;
+  readonly reasoning?: {
+    readonly defaultEffort?: string;
+    readonly efforts?: readonly { readonly id: string; readonly name?: string }[];
+  };
+};
+
+/** One provider group from `sessionController.modelCatalog()`. */
+export type CatalogGroup = {
+  readonly id: string;
+  readonly name?: string;
+  readonly models: readonly CatalogModel[];
+};
+
+/** The routable-model catalogue; only the parts `#模型` prints. */
+export type ModelCatalogLike = {
+  readonly default?: { readonly provider: string; readonly model: string; readonly reasoningEffort?: string };
+  readonly groups: readonly CatalogGroup[];
+  readonly failures?: readonly { readonly id: string; readonly name?: string; readonly message: string }[];
+};
+
 /** The part of the host's `sessionController` service this plugin uses. */
 type SessionControllerLike = {
   resolveAgent: (sessionId: unknown) => Promise<{ agent: LiveAgent } | { error: unknown }>;
@@ -65,6 +89,19 @@ type SessionControllerLike = {
    * have it, and the caller falls back to `sessionQuery`.
    */
   list?: (request: unknown, signal: AbortSignal) => Promise<{ items: ControllerSummary[] }>;
+  /** Create a conversation (`#新会话`). */
+  create?: (request: { cwd?: string; sessionId?: unknown }) => Promise<{ sessionId: unknown }>;
+  /** Cancel the active turn without dropping the queue (`#停一下`). */
+  cancel?: (request: { sessionId: unknown }) => { accepted: boolean };
+  /** Switch one conversation's model (`#模型 N`). */
+  selectModel?: (request: {
+    sessionId: unknown;
+    provider: string;
+    model: string;
+    reasoningEffort?: string;
+  }) => Promise<{ selected: unknown }>;
+  /** Every routable model, grouped by provider (`#模型`). */
+  modelCatalog?: () => Promise<ModelCatalogLike>;
 };
 
 type LiveAgent = {
@@ -314,6 +351,89 @@ export async function sendToDshSession(
     `dsh send: ${running ? "steered" : "followed up"} ${text.length} chars into ${sessionId}${woke ? " (woken)" : ""}`,
   );
   return { ok: true, delivered: running ? "steered" : "followup", woke, agent, before };
+}
+
+// ------------------------------------------------------- the session controls
+
+/**
+ * Create a conversation from the phone (`#新会话`).
+ *
+ * The `cwd` is the whole point: `wechat-main` froze its workspace when it was
+ * created (in the profile directory, before anyone configured one), and a
+ * config change only applies to conversations made afterwards (Q1). Creating
+ * the conversation here is what lets the next one start in the right place.
+ */
+export async function createDshSession(
+  ctx: Context,
+  cwd?: string,
+): Promise<{ ok: true; sessionId: string } | { ok: false; message: string }> {
+  const controller = sessionController(ctx);
+  if (controller?.create === undefined) {
+    return { ok: false, message: "这个 DSH 没有 sessionController.create，不能从外部新建会话" };
+  }
+  try {
+    const created = await controller.create(cwd === undefined ? {} : { cwd });
+    const sessionId = String(created.sessionId ?? "");
+    if (sessionId === "") return { ok: false, message: "宿主返回了空会话 id" };
+    logger.info(`dsh create: new session ${sessionId}${cwd === undefined ? "" : ` in ${cwd}`}`);
+    return { ok: true, sessionId };
+  } catch (err) {
+    return { ok: false, message: String((err as Error)?.message ?? err).slice(0, 200) };
+  }
+}
+
+/**
+ * Cancel one conversation's active turn (`#停一下`), without dropping its queue.
+ *
+ * Deliberately not an abort of the whole agent: a stopped turn is what the
+ * owner asked for, and whatever they already queued should still run.
+ */
+export function cancelDshSession(
+  ctx: Context,
+  sessionId: string,
+): { ok: true } | { ok: false; message: string } {
+  const controller = sessionController(ctx);
+  if (controller?.cancel === undefined) {
+    return { ok: false, message: "这个 DSH 没有 sessionController.cancel，不能从外部停回合" };
+  }
+  try {
+    const result = controller.cancel({ sessionId: SessionId(sessionId) });
+    return result?.accepted === true ? { ok: true } : { ok: false, message: "宿主没有接受这次取消" };
+  } catch (err) {
+    return { ok: false, message: String((err as Error)?.message ?? err).slice(0, 200) };
+  }
+}
+
+/** Every routable model, or undefined where the host cannot list them. */
+export async function readModelCatalog(ctx: Context): Promise<ModelCatalogLike | undefined> {
+  const controller = sessionController(ctx);
+  if (controller?.modelCatalog === undefined) return undefined;
+  try {
+    const catalog = await controller.modelCatalog();
+    return catalog !== undefined && Array.isArray(catalog.groups) ? catalog : undefined;
+  } catch (err) {
+    logger.warn(`dsh models: catalogue failed: ${String(err).slice(0, 160)}`);
+    return undefined;
+  }
+}
+
+/** Point one conversation at another model (`#模型 N`). */
+export async function selectDshModel(
+  ctx: Context,
+  sessionId: string,
+  selection: { provider: string; model: string; reasoningEffort?: string },
+): Promise<{ ok: true } | { ok: false; message: string }> {
+  const controller = sessionController(ctx);
+  if (controller?.selectModel === undefined) {
+    return { ok: false, message: "这个 DSH 没有 sessionController.selectModel，不能从外部换模型" };
+  }
+  try {
+    await controller.selectModel({ sessionId: SessionId(sessionId), ...selection });
+    logger.info(`dsh models: ${sessionId} -> ${selection.provider}/${selection.model}`);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, message: String((err as Error)?.message ?? err).slice(0, 200) };
+  }
 }
 
 // ---------------------------------------------------------------- the tools

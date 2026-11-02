@@ -19,6 +19,7 @@
  * `fetch` as a parameter, so the whole path is checkable without WeChat, a model,
  * or a running workbench (`test/capture.mjs`).
  */
+import type { LedgerDraft } from "./ledger.js";
 import { logger } from "./ilink/util/logger.js";
 
 /** How the page is read. A phone-shaped WeChat UA is what makes the article server answer with the article. */
@@ -437,6 +438,103 @@ export async function captureUrl(
     `capture: ${extracted.url} title=${extracted.title ?? "(none)"} chars=${extracted.text.length} html=${extracted.html.length}`,
   );
   return postCapture(config, extracted, fetchImpl);
+}
+
+// ------------------------------------------------------------------ the ledger
+
+/**
+ * The ledger line for one capture (D28), whichever way it came in.
+ *
+ * `#入库` and a bare link are the same act from the owner's side, so they file
+ * the same record — including the undo. Sharing it here is what keeps "撤销刚才
+ * 那个链接" working for the common case (a pasted link), not just the typed one.
+ */
+export function captureLedgerDraft(
+  result: CaptureResult,
+  url: string,
+  command: "入库" | "采集",
+): LedgerDraft {
+  if (!result.ok) {
+    return { command, args: { url, failure: result.kind }, result: "failed", summary: result.message };
+  }
+  const title = result.title?.trim() || "(没有标题)";
+  return {
+    command,
+    args: { url, captureId: result.id, duplicate: result.duplicate, short: result.short },
+    result: "ok",
+    summary: result.duplicate ? `收件箱里本来就有《${title}》` : `入库《${title}》`,
+    undo: { kind: "capture", captureId: result.id, url, title: result.title },
+  };
+}
+
+// ------------------------------------------------------------------ undoing
+
+/** Why a rejection did not happen. */
+export type RejectFailure = "config" | "network" | "not-found" | "not-implemented" | "conflict" | "server";
+
+/** What undoing a `#入库` learned from the workbench. */
+export type RejectResult =
+  | { readonly ok: true; readonly id: string; readonly already: boolean }
+  | { readonly ok: false; readonly kind: RejectFailure; readonly message: string };
+
+/**
+ * Take one capture back out of the inbox (D30).
+ *
+ * The endpoint is the extension-side `POST /captures/:id/reject` (OpenSpec
+ * change `workbench-capture-reject`). Until that ships the route 404s with no
+ * body — and that is exactly the ambiguity this separates: a workbench that
+ * answers with `{error}` means "no such capture", while a bare 404 or a 405
+ * means "this workbench cannot reject yet". Saying the wrong one would send the
+ * owner looking through the inbox for a capture that is right there.
+ */
+export async function rejectCapture(
+  captureId: string,
+  config: CaptureConfig,
+  fetchImpl: FetchLike = fetch,
+): Promise<RejectResult> {
+  if (!config.enabled || config.token.trim() === "") {
+    return { ok: false, kind: "config", message: "采集没开或没有 token，撤不了" };
+  }
+  const endpoint =
+    `${config.baseUrl.replace(/\/+$/u, "")}/api/v1/extension/captures/${encodeURIComponent(captureId)}/reject`;
+  let res: Response;
+  try {
+    res = await fetchImpl(endpoint, {
+      method: "POST",
+      headers: { authorization: `Bearer ${config.token}`, "content-type": "application/json" },
+      body: "{}",
+      signal: AbortSignal.timeout(POST_TIMEOUT_MS),
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      kind: "network",
+      message: `连不上工作台（${config.baseUrl}）：${String((err as Error).message ?? err).slice(0, 120)}`,
+    };
+  }
+  const raw = await res.text();
+  let body: { ok?: boolean; alreadyRejected?: boolean; error?: { code?: string; message?: string } } = {};
+  try {
+    body = raw === "" ? {} : (JSON.parse(raw) as typeof body);
+  } catch {
+    body = {};
+  }
+  if (res.ok) return { ok: true, id: captureId, already: body.alreadyRejected === true };
+  const detail = body.error?.message ?? (raw === "" ? `HTTP ${res.status}` : raw.slice(0, 120));
+  if (res.status === 404 && body.error?.code !== undefined) {
+    return { ok: false, kind: "not-found", message: `工作台里没有这条（${detail}）` };
+  }
+  if (res.status === 404 || res.status === 405) {
+    return {
+      ok: false,
+      kind: "not-implemented",
+      message: "这个工作台还没有撤销端点（extension 侧 reject）—— 只能在收件箱里点「拒绝」",
+    };
+  }
+  if (res.status === 409) {
+    return { ok: false, kind: "conflict", message: `已经被 accepted，撤不了（${detail}）` };
+  }
+  return { ok: false, kind: "server", message: `${body.error?.code ?? `http_${res.status}`}：${detail}` };
 }
 
 // ------------------------------------------------------------------ the receipt

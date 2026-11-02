@@ -28,6 +28,8 @@ const {
   extractArticle,
   trimHtml,
   captureUrl,
+  rejectCapture,
+  captureLedgerDraft,
   captureReceipt,
   shortId,
   SHORT_TEXT_CHARS,
@@ -309,7 +311,67 @@ const huge = await captureUrl(
 check("an oversized page is refused", huge.ok === false && huge.kind === "fetch");
 check("its receipt says nothing could be read", captureReceipt(huge).includes("抓不到正文"));
 
+// ---------------------------------------------------------------- the ledger line (D28)
+
+{
+  const filed = { ok: true, id: "cap-9", title: "一篇", chars: 900, duplicate: false, short: false, status: "pending", url: "https://e.x/a" };
+  const draft = captureLedgerDraft(filed, "https://e.x/a", "入库");
+  check("a filed capture becomes an undoable ledger line", draft.undo?.kind === "capture" && draft.undo.captureId === "cap-9");
+  check("the ledger line names the title", draft.undo?.title === "一篇");
+  check("the ledger line carries the command that filed it", draft.command === "入库" && draft.result === "ok");
+
+  const dup = captureLedgerDraft({ ...filed, duplicate: true }, "https://e.x/a", "采集");
+  check("a duplicate says so", dup.summary.includes("本来就有"), dup.summary);
+  check("a duplicate is still undoable", dup.undo?.kind === "capture");
+  check("a bare link is recorded under its own command", dup.command === "采集");
+
+  const short = captureLedgerDraft({ ...filed, short: true }, "https://e.x/a", "采集");
+  check("a short page is flagged for the timeline", short.args?.short === true);
+
+  const failed = captureLedgerDraft({ ok: false, kind: "fetch", message: "抓不到正文", url: "u" }, "https://e.x/a", "入库");
+  check("a failed capture has no undo", failed.undo === undefined);
+  check("a failed capture keeps the reason", failed.summary === "抓不到正文" && failed.result === "failed");
+}
+
+// ---------------------------------------------------------------- undoing a capture (D30)
+
+// The workbench answers 200 with alreadyRejected for a second undo, 409 once the
+// capture was accepted, and (until the change lands) a bare 404 for the route.
+const rejectStub = (status, body) =>
+  stub([{ match: (url) => url.includes("/reject"), reply: () => (body === undefined ? new Response("", { status }) : okResponse(body, status)) }]);
+
+calls.length = 0;
+const undone = await rejectCapture("cap-1234", CONFIG, rejectStub(200, { ok: true }));
+check("a rejected capture is reported as done", undone.ok === true, JSON.stringify(undone));
+check("the undo calls the extension reject route", calls[0].url === "http://127.0.0.1:9999/api/v1/extension/captures/cap-1234/reject", calls[0].url);
+check("the undo is a POST", calls[0].init.method === "POST");
+check("the undo carries the token", String(calls[0].init.headers.authorization) === "Bearer tok");
+
+const again = await rejectCapture("cap-1234", CONFIG, rejectStub(200, { ok: true, alreadyRejected: true }));
+check("an already-rejected capture says so", again.ok === true && again.already === true);
+
+const conflict = await rejectCapture("cap-1234", CONFIG, rejectStub(409, { error: { code: "conflict", message: "already accepted" } }));
+check("an accepted capture cannot be undone", conflict.ok === false && conflict.kind === "conflict", JSON.stringify(conflict));
+check("the conflict message keeps the server's words", conflict.message.includes("already accepted"), conflict.message);
+
+const missingRoute = await rejectCapture("cap-1234", CONFIG, rejectStub(404));
+check("a bare 404 means the workbench has no reject route", missingRoute.ok === false && missingRoute.kind === "not-implemented", JSON.stringify(missingRoute));
+check("that message tells the owner what to do instead", missingRoute.message.includes("收件箱"), missingRoute.message);
+
+const missingCapture = await rejectCapture("cap-1234", CONFIG, rejectStub(404, { error: { code: "not_found", message: "no such capture" } }));
+check("a 404 with an error body means the capture is gone", missingCapture.ok === false && missingCapture.kind === "not-found", JSON.stringify(missingCapture));
+
+const methodNotAllowed = await rejectCapture("cap-1234", CONFIG, rejectStub(405));
+check("405 also means the route is not there", methodNotAllowed.ok === false && methodNotAllowed.kind === "not-implemented");
+
+const downWorkbench = await rejectCapture("cap-1234", CONFIG, async () => { throw new Error("ECONNREFUSED"); });
+check("a workbench that is down is a network failure", downWorkbench.ok === false && downWorkbench.kind === "network", JSON.stringify(downWorkbench));
+
+const noToken = await rejectCapture("cap-1234", { ...CONFIG, token: "  " });
+check("without a token nothing is attempted", noToken.ok === false && noToken.kind === "config");
+
 // ---------------------------------------------------------------- report
+
 
 if (failures.length > 0) {
   console.error(`capture: ${pass} passed, ${failures.length} failed`);

@@ -67,7 +67,10 @@
     "test:relay": "node test/relay.mjs",
     "test:monitor": "node test/monitor.mjs",
     "test:approvals": "node test/approvals.mjs",
-    "test:unit": "npm run build && node test/commands.mjs && node test/capture.mjs && node test/modes.mjs && node test/relay.mjs && node test/monitor.mjs && node test/approvals.mjs"
+    "test:ledger": "node test/ledger.mjs",
+    "test:timeline": "node test/timeline.mjs",
+    "test:stop": "node test/stop.mjs",
+    "test:unit": "npm run build && node test/commands.mjs && node test/capture.mjs && node test/modes.mjs && node test/relay.mjs && node test/monitor.mjs && node test/approvals.mjs && node test/ledger.mjs && node test/stop.mjs && node test/timeline.mjs"
   },
   "dsh": {
     "bundle": {

@@ -208,6 +208,147 @@ notes.length = 0;
 const unready = await run("#入库 https://example.com/x", { capture: async () => filed, captureReady: false });
 check("#入库 without a token explains the config", unready.includes("capture"), unready);
 check("#入库 without a token notes nothing", notes.length === 0);
+// ---------------------------------------------------------------- the newer commands (D12/D14/D30, Q1/Q3)
+
+const { StopConfirms } = await import(join(ROOT, "lib/stop.js"));
+
+// A host that can create, cancel and re-model conversations.
+const controlCtx = (controller) => ({
+  agents: { list: () => [] },
+  get: (name) => (name === "sessionController" ? controller : undefined),
+});
+
+// #停一下, agent mode: the turn this chat just started, so it stops at once.
+let cancelled = null;
+const stopAgent = await run("#停一下", {
+  ctx: controlCtx({ resolveAgent: async () => ({}), cancel: (req) => { cancelled = req; return { accepted: true }; } }),
+});
+check("#停一下 cancels the WeChat session's own turn", cancelled?.sessionId === "wechat-main");
+check("#停一下 says it stopped", stopAgent.includes("已停"), stopAgent);
+
+// #停一下, relay mode: the turn belongs to someone else's conversation, so it asks.
+store.release("wxid_me");
+store.bind("wxid_me", { sessionId: "session-alpha", title: "重构导入流程" });
+const stops = new StopConfirms();
+cancelled = null;
+const asked = await run("#停一下", {
+  stop: stops,
+  ctx: controlCtx({ resolveAgent: async () => ({}), cancel: (req) => { cancelled = req; return { accepted: true }; } }),
+});
+check("#停一下 during a relay asks first", asked.includes("回「停」才停"), asked);
+check("#停一下 during a relay cancels nothing yet", cancelled === null);
+check("#停一下 during a relay records the target", stops.pending("wxid_me", 1_000_000)?.sessionId === "session-alpha");
+store.release("wxid_me");
+
+// #新会话 creates in the configured workspace and takes it over (Q1).
+let createdWith = "unset";
+const newSessionReply = await run("#新会话", {
+  cwd: "/Users/someone/workspace/global-seo",
+  ctx: controlCtx({
+    resolveAgent: async () => ({}),
+    create: async (request) => { createdWith = request.cwd; return { sessionId: "session-new" }; },
+  }),
+});
+check("#新会话 creates with the configured cwd", createdWith === "/Users/someone/workspace/global-seo", String(createdWith));
+check("#新会话 takes the new conversation over", store.lookup("wxid_me").binding?.sessionId === "session-new");
+check("#新会话 reports the workspace", newSessionReply.includes("global-seo"), newSessionReply);
+check("#新会话 notes that the agent will not see those messages", notes.at(-1)?.includes("看不到"), notes.at(-1));
+store.release("wxid_me");
+
+// A host without create must say so, not pretend.
+const noCreate = await run("#新会话", { cwd: "/tmp/x", ctx: controlCtx({ resolveAgent: async () => ({}) }) });
+check("#新会话 without a controller explains itself", noCreate.includes("不能从外部新建"), noCreate);
+
+// #模型 lists the routable catalogue, numbered, with the deployment default marked (Q3).
+let picked = null;
+const catalogCtx = controlCtx({
+  resolveAgent: async () => ({}),
+  modelCatalog: async () => ({
+    default: { provider: "deepseek-official", model: "deepseek-v4.1-flash" },
+    groups: [
+      {
+        id: "deepseek-official",
+        name: "DeepSeek",
+        models: [
+          { id: "deepseek-v4.1-flash", name: "V4.1 Flash", reasoning: { defaultEffort: "low" } },
+          { id: "deepseek-v4.1-pro", name: "V4.1 Pro" },
+        ],
+      },
+      { id: "siliconflow", name: "硅基流动", models: [{ id: "qwen3", name: "Qwen3" }] },
+    ],
+  }),
+  selectModel: async (request) => { picked = request; return { selected: {} }; },
+});
+const listed = await run("#模型", { ctx: catalogCtx });
+check("#模型 says how many there are", listed.includes("可用模型 3 个"), listed);
+check("#模型 groups by provider", listed.includes("DeepSeek") && listed.includes("硅基流动"), listed);
+check("#模型 numbers them across groups", / 3\. Qwen3/u.test(listed), listed);
+check("#模型 marks the deployment default", listed.includes("V4.1 Flash（默认）"), listed);
+
+picked = null;
+const switched = await run("#模型 2", { ctx: catalogCtx });
+check("#模型 N selects the numbered model", picked?.model === "deepseek-v4.1-pro", JSON.stringify(picked));
+check("#模型 N keeps the provider", picked?.provider === "deepseek-official", JSON.stringify(picked));
+check("#模型 N names what it picked", switched.includes("V4.1 Pro"), switched);
+
+picked = null;
+const lowEffort = await run("#模型 1", { ctx: catalogCtx });
+check("#模型 N carries the model's default reasoning effort", picked?.reasoningEffort === "low", JSON.stringify(picked));
+check("#模型 N says the effort", lowEffort.includes("推理 low"), lowEffort);
+check("#模型 99 is refused", (await run("#模型 99", { ctx: catalogCtx })).includes("没有第 99 个"));
+
+// While relaying, #模型 switches THAT conversation, not the WeChat one.
+store.bind("wxid_me", { sessionId: "session-alpha", title: "重构导入流程" });
+picked = null;
+const switchingRelay = await run("#模型 2", { ctx: catalogCtx });
+check("#模型 during a relay switches the relayed conversation", picked?.sessionId === "session-alpha", JSON.stringify(picked));
+check("#模型 during a relay says so", switchingRelay.includes("接管中"), switchingRelay);
+store.release("wxid_me");
+
+// A host without the service says so instead of an empty list.
+check("#模型 without a catalogue explains itself", (await run("#模型", { ctx: fakeCtx })).includes("读不到模型清单"));
+
+// #允许 / #拒绝 answer the pending approval and let the approval path print its own receipt.
+let decisions = [];
+const answered = await run("#允许", { approve: (d) => { decisions.push(d); return "answered"; } });
+check("#允许 answers yes", decisions.length === 1 && decisions[0] === "yes");
+check("#允许 stays silent (the approval path says 已批准)", answered === "");
+const refused = await run("#拒绝", { approve: () => "answered" });
+check("#拒绝 stays silent too", refused === "");
+check("#允许 with nothing pending says so", (await run("#允许", { approve: () => "none" })).includes("没有待批的权限请求"));
+check("#允许 while a question waits does not answer it", (await run("#允许", { approve: () => "question" })).includes("不是权限请求"));
+
+// ---------------------------------------------------------------- the ledger (D28)
+
+const recorded = [];
+const recordInto = (extra = {}) => ({ record: (draft) => recorded.push(draft), ...extra });
+
+recorded.length = 0;
+await run("#帮助", recordInto());
+check("a read-only command is recorded too", recorded.length === 1 && recorded[0].command === "帮助", JSON.stringify(recorded));
+check("a read-only command has no undo", recorded[0].undo === undefined || recorded[0].undo === null);
+
+recorded.length = 0;
+await run("#入库 https://mp.weixin.qq.com/s/Ledger", recordInto({ capture: async () => filed, captureReady: true }));
+const captureRecord = recorded.find((e) => e.command === "入库");
+check("a filed link is recorded with its capture id", captureRecord?.args?.captureId === filed.id, JSON.stringify(recorded));
+check("a filed link can be undone", captureRecord?.undo?.kind === "capture" && captureRecord.undo.captureId === filed.id);
+check("the record keeps the title for the receipt", captureRecord?.undo?.title === "标题");
+
+recorded.length = 0;
+await run("#入库 https://example.com/bad", recordInto({ capture: async () => ({ ok: false, kind: "fetch", message: "抓不到正文", url: "u" }), captureReady: true }));
+check("a failed capture is recorded as failed", recorded[0]?.result === "failed", JSON.stringify(recorded));
+check("a failed capture has no undo", recorded[0]?.undo === undefined);
+
+recorded.length = 0;
+store.bind("wxid_me", { sessionId: "session-alpha", title: "重构导入流程" });
+await run("#交还", recordInto());
+check("#交还 can be undone by taking it over again", recorded[0]?.undo?.kind === "relay-release" && recorded[0].undo.previous.sessionId === "session-alpha", JSON.stringify(recorded));
+
+recorded.length = 0;
+await run("#交还", recordInto());
+check("#交还 with nothing bound is recorded as a no-op", recorded[0]?.result === "noop", JSON.stringify(recorded));
+
 rmSync(DIR, { recursive: true, force: true });
 
 console.log(`commands: ${pass} passed, ${failures.length} failed`);
