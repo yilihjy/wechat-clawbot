@@ -68,8 +68,11 @@ export interface ClawbotConfig {
   forwardQuestions: boolean;
 
   /**
-   * How long (ms) an approval question waits for a WeChat answer before
-   * failing closed. `0` (default) waits indefinitely.
+   * How long (ms) an approval question waits for a WeChat answer before it is
+   * withdrawn (D44). 30 minutes by default: an approval that nobody answers
+   * otherwise holds the turn — and now that relayed conversations can route
+   * their approvals here, it would hold a desktop session too. `0` opts back
+   * into waiting forever.
    */
   approvalTimeoutMs: number;
 
@@ -271,7 +274,7 @@ export const DEFAULT_CONFIG: ClawbotConfig = {
   sessionId: "wechat-main",
   cwd: undefined,
   forwardQuestions: false,
-  approvalTimeoutMs: 0,
+  approvalTimeoutMs: 30 * 60_000,
   botAgent: "DSH-ClawBot/0.1.0 (wechat-clawbot)",
   apiBaseUrl: "https://ilinkai.weixin.qq.com",
   logLevel: "info",
@@ -542,9 +545,12 @@ export const BaseConfig = Schema.object({
     .min(0)
     .description("发文件超过这个字节数才先发一条「正在发送」预告。0 = 每个文件都预告"),
   approvalTimeoutMs: Schema.number()
-    .default(0)
+    .default(30 * 60_000)
     .min(0)
-    .description("审批类问题等待微信回答的超时(毫秒)。0 = 一直等"),
+    .description(
+      "审批类问题等微信回答多久(毫秒),默认 30 分钟:超时就撤掉这张卡、微信回一句「审批超时,这一轮已停」。"
+      + "因为无人回答的审批会一直挂着那个回合(接管中的会话也会被挂住)。0 = 一直等",
+    ),
   logLevel: Schema.union(["debug", "info", "warn", "error"] as const)
     .default("info")
     .description("协议层日志级别"),

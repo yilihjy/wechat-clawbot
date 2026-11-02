@@ -109,6 +109,82 @@ equal(
   { kind: "wechat", sender: "wxid_me" },
 );
 
+// ---------------------------------------------------------------- the timeout (D44)
+
+const { ApprovalRelay } = await import(join(ROOT, "lib/approvals.js"));
+const { PendingRegistry } = await import(join(ROOT, "lib/pending.js"));
+const { normalizeConfig } = await import(join(ROOT, "lib/config.js"));
+
+// 30 minutes is the shipped default: an unanswered approval otherwise holds the
+// turn — and a relayed conversation's turn on the desktop too.
+equal("the default approval timeout is 30 minutes", normalizeConfig({}).approvalTimeoutMs, 30 * 60_000);
+equal("an explicit 0 still means wait forever", normalizeConfig({ approvalTimeoutMs: 0 }).approvalTimeoutMs, 0);
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+// The relay unrefs its timeout timer so it can never hold DSH open. In this
+// harness nothing else does either, so keep the loop alive while we wait.
+const keepAlive = setInterval(() => {}, 1_000);
+function harness({ timeoutMs, sender = "wxid_me" }) {
+  const pending = new PendingRegistry();
+  const sent = [];
+  const relay = new ApprovalRelay({
+    config: { approvalTimeoutMs: timeoutMs },
+    getBridge: () => ({ isWechatSession: () => true, activeSender: sender }),
+    pending,
+    sendText: async (_to, text) => {
+      sent.push(text);
+    },
+  });
+  return { pending, sent, relay };
+}
+const request = (signal) => ({ agent: { id: "a1" }, toolName: "bash", reason: "计时", signal });
+
+// Nobody answers: the card is withdrawn and the phone is told why.
+{
+  const { pending, sent, relay } = harness({ timeoutMs: 20 });
+  const outcome = relay.answer(request(new AbortController().signal), async () => "allowed-once");
+  await sleep(5); // `answer` sends the question first, then queues
+  check("a timeout waits on the sender", pending.hasFor("wxid_me"));
+  equal("a timed-out approval settles as cancelled", await outcome, "cancelled");
+  check("the timed-out approval leaves the queue", !pending.hasFor("wxid_me"));
+  check("the phone is told the turn stopped", sent.some((text) => text.includes("审批超时")), sent.join(" | "));
+}
+
+// Answered in time: no timeout line afterwards, one outcome.
+{
+  const { pending, sent, relay } = harness({ timeoutMs: 80 });
+  const outcome = relay.answer(request(new AbortController().signal), async () => "allowed-once");
+  await sleep(5);
+  pending.popFor("wxid_me")?.resolve("同意");
+  equal("an answered approval settles the usual way", await outcome, "allowed-once");
+  await sleep(120);
+  check("no timeout line after an answer", !sent.some((text) => text.includes("审批超时")), sent.join(" | "));
+}
+
+// Aborted: silent. Saying "审批超时" for a turn the user stopped would be a lie.
+{
+  const { sent, relay } = harness({ timeoutMs: 5_000 });
+  const stop = new AbortController();
+  const outcome = relay.answer(request(stop.signal), async () => "allowed-once");
+  await sleep(5);
+  stop.abort();
+  equal("an aborted approval settles as cancelled", await outcome, "cancelled");
+  check("an abort says nothing", !sent.some((text) => text.includes("审批超时")), sent.join(" | "));
+}
+
+// Opting out still works: 0 never times out.
+{
+  const { pending, sent, relay } = harness({ timeoutMs: 0 });
+  const outcome = relay.answer(request(new AbortController().signal), async () => "allowed-once");
+  await sleep(30);
+  check("0 keeps waiting", pending.hasFor("wxid_me"));
+  check("0 never sends a timeout line", !sent.some((text) => text.includes("审批超时")), sent.join(" | "));
+  pending.popFor("wxid_me")?.resolve(null);
+  equal("and can still be withdrawn by an abort", await outcome, "cancelled");
+}
+
+clearInterval(keepAlive);
+
 if (failures.length > 0) {
   console.error(`approvals: ${pass} passed, ${failures.length} failed`);
   for (const failure of failures) console.error(`  ✗ ${failure}`);

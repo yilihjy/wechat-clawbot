@@ -150,9 +150,11 @@ export class ApprovalRelay {
 
     return new Promise<ApprovalOutcome>((resolveOutcome) => {
       let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
       const settle = (outcome: ApprovalOutcome): void => {
         if (settled) return;
         settled = true;
+        if (timer !== undefined) clearTimeout(timer);
         resolveOutcome(outcome);
       };
 
@@ -176,14 +178,26 @@ export class ApprovalRelay {
       // Withdraw the question when the requesting turn is aborted or it times
       // out. Leaving the entry queued would make the sender's next WeChat
       // message answer a request nobody is waiting on — and eat that message.
-      const withdraw = (): void => {
+      //
+      // The two reasons are not the same for the user: an abort means the turn
+      // was stopped (saying anything would be noise), while a timeout means the
+      // bot waited for an answer that never came — silence there looks like the
+      // bot hung, so D44 gives it a line.
+      const withdraw = (reason: "aborted" | "timeout"): void => {
+        if (settled) return;
         this.pending.remove(answer);
-        answer.resolve(null);
+        if (reason === "timeout") {
+          void this.sendText(sender, "审批超时，这一轮已停。").catch(() => {});
+        }
+        settle("cancelled");
       };
-      req.signal?.addEventListener("abort", withdraw, { once: true });
+      req.signal?.addEventListener("abort", () => withdraw("aborted"), { once: true });
 
-      if (this.config.approvalTimeoutMs > 0) {
-        setTimeout(withdraw, this.config.approvalTimeoutMs).unref?.();
+      const timeoutMs = this.config.approvalTimeoutMs;
+      if (timeoutMs > 0) {
+        timer = setTimeout(() => withdraw("timeout"), timeoutMs);
+        // Do not hold the process open for a question nobody will answer.
+        timer.unref?.();
       }
     });
   }

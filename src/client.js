@@ -942,13 +942,13 @@ window.__ModuleLoader__.load({
           }),
         }),
         Field({
-          label: "审批等待超时", hint: "秒。0 = 一直等",
+          label: "审批等待超时", hint: "秒。超时撤卡并回一句「审批超时」。0 = 一直等",
           overridden: isSet("approvalTimeoutMs"), disabled,
           onReset: () => clear("approvalTimeoutMs"),
           control: h("input", {
             type: "number", className: S.input, min: 0, disabled,
             value: v.approvalTimeoutMs === undefined ? "" : v.approvalTimeoutMs / 1000,
-            placeholder: "0",
+            placeholder: "1800",
             onChange: (e) => num("approvalTimeoutMs", e.target.value, 1000),
           }),
         }),
