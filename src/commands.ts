@@ -30,7 +30,7 @@ import {
   type ModelCatalogLike,
 } from "./dsh-sessions.js";
 import type { LedgerDraft } from "./ledger.js";
-import { describeBinding, remainingText, type ModeStore } from "./modes.js";
+import { describeBinding, remainingText, shortSessionId, type ModeStore } from "./modes.js";
 import type { StopConfirms } from "./stop.js";
 
 /** Trailing punctuation that a phone keyboard adds and a command must ignore. */
@@ -154,6 +154,8 @@ export interface CommandDeps {
   readonly stop?: StopConfirms;
   /** Answer a pending approval from a command (D12). */
   readonly approve?: (decision: "yes" | "no") => "answered" | "question" | "none";
+  /** Drop a mirror the relay still owes for a conversation that lost its binding. */
+  readonly forgetMirror?: (sessionId: string) => void;
 }
 
 /** File one command, if a ledger is wired up (D28). */
@@ -241,6 +243,10 @@ async function takeOver(deps: CommandDeps, arg: string): Promise<string> {
   if (index < 1 || index > numbered.length) return `没有第 ${index} 个。发「#任务状态」看当前列表。`;
   const row = numbered[index - 1]!;
   const title = titleOf(row);
+  // Rebinding ends whatever the previous conversation was owed: an answer still
+  // in flight there belongs to a phone that has moved on.
+  const previous = deps.modes.lookup(deps.peer).binding;
+  if (previous !== null && previous.sessionId !== row.id) deps.forgetMirror?.(previous.sessionId);
   const binding = deps.modes.bind(deps.peer, { sessionId: row.id, title });
   // >>> local: D29 命令注入
   // 接管之后微信的消息不再进这个会话，所以它必须知道"我去哪了"，
@@ -271,7 +277,8 @@ function handBack(deps: CommandDeps): string {
     record(deps, { command: "交还", result: "noop", summary: "本来就没在接管" });
     return "现在没在接管，消息都给专属 agent。";
   }
-  const title = dropped.title.trim() === "" ? dropped.sessionId.slice(0, 8) : dropped.title;
+  deps.forgetMirror?.(dropped.sessionId);
+  const title = dropped.title.trim() === "" ? shortSessionId(dropped.sessionId) : dropped.title;
   deps.note?.(`[命令] ${clockText((deps.now ?? Date.now)())} #交还 → 《${title}》已结束接管，消息回到这里。`);
   record(deps, {
     command: "交还",
@@ -323,7 +330,7 @@ function stopCommand(deps: CommandDeps): string {
     : deps.modes.lookup(deps.peer);
   if (lookup.binding !== null) {
     if (deps.stop === undefined) return "接管中停回合要先确认，但这里没有确认存储。";
-    const title = lookup.binding.title.trim() === "" ? lookup.binding.sessionId.slice(0, 8) : lookup.binding.title;
+    const title = lookup.binding.title.trim() === "" ? shortSessionId(lookup.binding.sessionId) : lookup.binding.title;
     deps.stop.request(deps.peer!, { sessionId: lookup.binding.sessionId, title }, now);
     record(deps, {
       command: "停一下",
@@ -351,6 +358,8 @@ async function newSession(deps: CommandDeps): Promise<string> {
     return `新建会话失败：${created.message}`;
   }
   // Title is unknown until the first message names it; relay falls back to the id.
+  const previous = deps.modes.lookup(deps.peer).binding;
+  if (previous !== null) deps.forgetMirror?.(previous.sessionId);
   deps.modes.bind(deps.peer, { sessionId: created.sessionId, title: "" });
   deps.note?.(
     `[命令] ${clockText((deps.now ?? Date.now)())} #新会话 → 新建并接管 ${created.sessionId}；此后的微信消息进了那个会话，我这里看不到。`,
@@ -359,7 +368,7 @@ async function newSession(deps: CommandDeps): Promise<string> {
     command: "新会话",
     args: { sessionId: created.sessionId },
     result: "ok",
-    summary: `新建并接管 ${created.sessionId.slice(0, 8)}`,
+    summary: `新建并接管 ${shortSessionId(created.sessionId)}`,
     // A conversation that did not exist before has nothing to go back to.
     undo: null,
   });
@@ -406,7 +415,7 @@ async function modelCommand(deps: CommandDeps, arg: string): Promise<string> {
   const target = lookup.binding?.sessionId ?? deps.sessionId;
   const where = lookup.binding === null
     ? ""
-    : `（切的是接管中的《${lookup.binding.title.trim() === "" ? lookup.binding.sessionId.slice(0, 8) : lookup.binding.title}》）`;
+    : `（切的是接管中的《${lookup.binding.title.trim() === "" ? shortSessionId(lookup.binding.sessionId) : lookup.binding.title}》）`;
 
   if (arg === "") {
     const shown = choices.slice(0, MODEL_LIMIT);

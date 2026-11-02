@@ -81,9 +81,20 @@ export function remainingText(binding: RelayBinding, now: number, ttlMs: number 
 }
 
 /** The one-line description `#当前模式` prints for a binding. */
+/**
+ * A session id short enough for a phone.
+ *
+ * Slicing the raw id gives "session-" for every conversation (they all start
+ * with the same prefix), which is worse than useless in a receipt: it was the
+ * title of a `#新会话` binding on 2026-11-03 until this existed.
+ */
+export function shortSessionId(sessionId: string): string {
+  return sessionId.replace(/^session-/u, "").slice(0, 8);
+}
+
 export function describeBinding(binding: RelayBinding, now: number, ttlMs: number = RELAY_TTL_MS): string {
-  const title = binding.title.trim() === "" ? binding.sessionId.slice(0, 8) : binding.title;
-  return `《${title}》 · ${binding.sessionId.slice(0, 8)} · ${remainingText(binding, now, ttlMs)}`;
+  const title = binding.title.trim() === "" ? shortSessionId(binding.sessionId) : binding.title;
+  return `《${title}》 · ${shortSessionId(binding.sessionId)} · ${remainingText(binding, now, ttlMs)}`;
 }
 
 /** Validate one stored binding; anything malformed is dropped rather than trusted. */

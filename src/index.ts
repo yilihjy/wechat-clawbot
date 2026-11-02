@@ -381,6 +381,9 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
   // 长文走同一条文件通道（sendFileTo），没有账号时就退化成截断（见 relay.ts）。
   relays = new RelayService({
     sendText,
+    // An answer is only owed while that conversation is still the one the phone
+    // is driving; `#交还` can land in the middle of a turn (see relay.ts).
+    isStillBound: (sessionId, peer) => modes.lookup(peer).binding?.sessionId === sessionId,
     deliver: async (sessionId, text) => {
       const sent = await sendToDshSession(ctx, sessionId, text, { kind: "plugin:clawbot-wechat", wake: true });
       return sent.ok ? { ok: true } : { ok: false, message: sent.message };

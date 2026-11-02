@@ -93,9 +93,11 @@ function harness(options = {}) {
             files.push({ to, name, text });
           },
         }),
+    // Bindings are checked at flush time: a hand-back can happen mid-turn.
+    ...(options.bound === undefined ? {} : { isStillBound: options.bound }),
     now: () => clock,
   });
-  return { relay, sent, delivered, files, advance: (ms) => { clock += ms; }, now: () => clock };
+  return { relay, sent, delivered, files, advance: (ms) => { clock += ms; }, now: () => clock, setBound: (fn) => { options.bound = fn; } };
 }
 
 const BINDING = { sessionId: "session-alpha", title: "重构导入流程" };
@@ -120,6 +122,49 @@ check("the mirror goes to the peer", h.sent[0].to === "wxid_me");
 check("the expectation is cleared", !h.relay.isExpecting("session-alpha"));
 h.relay.onSessionEvent("session-alpha", { type: "turn/end", data: {} });
 check("a later turn is not mirrored", h.sent.length === 1);
+
+// #交还 while the turn is still running: the answer is not owed any more.
+// (2026-11-03 00:04 — the long "404" answer was mirrored after a hand-back.)
+{
+  let bound = true;
+  const h2 = harness({ bound: () => bound });
+  await h2.relay.relay("wxid_me", BINDING, "帮我查一下");
+  h2.relay.onSessionEvent("session-alpha", { type: "assistant/message", data: { message: { content: [{ type: "text", text: "查到了。" }] } } });
+  bound = false; // the owner sent #交还
+  h2.relay.onSessionEvent("session-alpha", { type: "turn/end", data: {} });
+  await flush();
+  equal("an answer after a hand-back is not mirrored", h2.sent.length, 0);
+  check("and the expectation is gone", !h2.relay.isExpecting("session-alpha"));
+}
+
+// forget() is what #交还 calls: nothing stays owed for that conversation.
+{
+  const h3 = harness();
+  await h3.relay.relay("wxid_me", BINDING, "在吗");
+  h3.relay.forget("session-alpha");
+  check("forget drops the expectation", !h3.relay.isExpecting("session-alpha"));
+  h3.relay.onSessionEvent("session-alpha", { type: "assistant/message", data: { message: { content: [{ type: "text", text: "在" }] } } });
+  h3.relay.onSessionEvent("session-alpha", { type: "turn/end", data: {} });
+  await flush();
+  equal("a forgotten session sends nothing", h3.sent.length, 0);
+}
+
+// #停一下 already said "已停《…》"; the cancelled turn must not answer too.
+{
+  const h4 = harness();
+  await h4.relay.relay("wxid_me", BINDING, "数数");
+  h4.relay.onSessionEvent("session-alpha", { type: "assistant/message", data: { message: { content: [{ type: "text", text: "1 2 3" }] } } });
+  h4.relay.onSessionEvent("session-alpha", { type: "turn/end", data: { reason: { kind: "aborted" } } });
+  await flush();
+  equal("a stopped turn is not mirrored", h4.sent.length, 0);
+  const done = harness();
+  await done.relay.relay("wxid_me", BINDING, "数数");
+  done.relay.onSessionEvent("session-alpha", { type: "assistant/message", data: { message: { content: [{ type: "text", text: "1 2 3" }] } } });
+  done.relay.onSessionEvent("session-alpha", { type: "turn/end", data: { reason: { kind: "completed" } } });
+  await flush();
+  equal("a completed turn is mirrored", done.sent.length, 1);
+  check("the completed answer is the text", done.sent[0].text.includes("1 2 3"));
+}
 
 // A conversation the user drives on the desktop is never echoed.
 h = harness();

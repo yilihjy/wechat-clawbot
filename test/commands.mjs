@@ -318,6 +318,35 @@ check("#拒绝 stays silent too", refused === "");
 check("#允许 with nothing pending says so", (await run("#允许", { approve: () => "none" })).includes("没有待批的权限请求"));
 check("#允许 while a question waits does not answer it", (await run("#允许", { approve: () => "question" })).includes("不是权限请求"));
 
+// A mirror the relay still owes must not survive the binding it belonged to
+// (2026-11-03 00:04: an answer was mirrored after #交还).
+{
+  const forgotten = [];
+  const forget = (sessionId) => forgotten.push(sessionId);
+  store.release("wxid_me");
+  store.bind("wxid_me", { sessionId: "session-alpha", title: "重构导入流程" });
+  await run("#交还", { forgetMirror: forget });
+  check("#交还 forgets the mirror owed for that conversation", forgotten.includes("session-alpha"), forgotten.join(","));
+
+  forgotten.length = 0;
+  // #接管 1 is 重构导入流程 (session-alpha), so binding to a different one first
+  // is what makes "the previous mirror" observable.
+  store.bind("wxid_me", { sessionId: "session-beta", title: "写周报" });
+  await run("#接管 1", { forgetMirror: forget });
+  check("#接管 forgets the previous conversation's mirror", forgotten.includes("session-beta"), forgotten.join(","));
+  store.release("wxid_me");
+
+  forgotten.length = 0;
+  store.bind("wxid_me", { sessionId: "session-beta", title: "写周报" });
+  await run("#新会话", {
+    cwd: "/tmp/x",
+    forgetMirror: forget,
+    ctx: controlCtx({ resolveAgent: async () => ({}), create: async () => ({ sessionId: "session-new" }) }),
+  });
+  check("#新会话 forgets the previous conversation's mirror", forgotten.includes("session-beta"), forgotten.join(","));
+  store.release("wxid_me");
+}
+
 // ---------------------------------------------------------------- the ledger (D28)
 
 const recorded = [];

@@ -19,7 +19,7 @@ import { fileURLToPath } from "node:url";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, "..");
 
-const { ModeStore, RELAY_TTL_MS, isRelayActive, isFresh, remainingMs, remainingText, describeBinding } = await import(
+const { ModeStore, RELAY_TTL_MS, isRelayActive, isFresh, remainingMs, remainingText, describeBinding, shortSessionId } = await import(
   join(ROOT, "lib/modes.js")
 );
 
@@ -132,4 +132,10 @@ if (failures.length > 0) {
   for (const failure of failures) console.error(`  ✗ ${failure}`);
   process.exit(1);
 }
+// A phone-readable id: every session id starts with "session-", so slicing the
+// raw id names every conversation "session-" (it did, on 2026-11-03).
+check("shortSessionId drops the prefix", shortSessionId("session-5c614db8-b450-43e6-9959-b11514b7c5c0") === "5c614db8");
+check("shortSessionId keeps a bare id", shortSessionId("5c614db8") === "5c614db8");
+check("shortSessionId survives nonsense", shortSessionId("session-") === "");
+
 console.log(`modes: ${pass} passed, 0 failed`);

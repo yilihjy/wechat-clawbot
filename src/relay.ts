@@ -35,6 +35,12 @@ export function wrapInbound(text: string): string {
   return `用户在微信里说：\n${text}`;
 }
 
+/** Why a turn ended, as `turn/end` records it (DSH's `TurnEndReason.kind`). */
+export function turnEndReason(data: unknown): string | undefined {
+  const reason = (data as { reason?: { kind?: unknown } } | undefined)?.reason;
+  return typeof reason?.kind === "string" ? reason.kind : undefined;
+}
+
 /** D15: the title prefix a mirrored answer carries. */
 export function replyPrefix(title: string): string {
   return `[${title.trim() === "" ? "会话" : title.trim()}] `;
@@ -117,6 +123,17 @@ export interface RelayDeps {
   deliver: (sessionId: string, text: string) => Promise<RelayResult>;
   /** Send a long answer as a file; without it a long answer is clipped. */
   sendFile?: (to: string, name: string, text: string) => Promise<void>;
+  /**
+   * Is this conversation still the one bound to that peer?
+   *
+   * The answer decides whether an answer is still owed: `#交还` (or a rebind, or
+   * the 30-minute expiry) can happen while the relayed turn is still running, and
+   * an answer that arrives afterwards belongs to a conversation the phone has
+   * already left. Without this check the owner gets a reply to something they
+   * handed back — measured 2026-11-03 00:04, the long "404" answer was mirrored
+   * after `#交还` at 00:00:16.
+   */
+  isStillBound?: (sessionId: string, peer: string) => boolean;
   now?: () => number;
 }
 
@@ -169,10 +186,30 @@ export class RelayService {
       if (text !== "") expectation.chunks.push(text);
       return;
     }
-    if (event.type === "turn/end") {
-      this.expected.delete(sessionId);
-      void this.mirror(expectation);
+    if (event.type !== "turn/end") return;
+
+    this.expected.delete(sessionId);
+    // A turn the owner stopped with `#停一下` was already acknowledged on the
+    // phone ("已停《…》"). Mirroring it now would answer a question nobody asked.
+    if (turnEndReason(event.data) === "aborted") {
+      logger.info(`relay: ${sessionId} was stopped; nothing to mirror`);
+      return;
     }
+    // The binding is the reason an answer is owed. If it ended first, so did the
+    // debt — the next turn in that conversation belongs to whoever drives it now.
+    if (this.deps.isStillBound !== undefined && !this.deps.isStillBound(sessionId, expectation.peer)) {
+      logger.info(`relay: ${sessionId} is no longer bound; its answer is not mirrored`);
+      return;
+    }
+    void this.mirror(expectation);
+  }
+
+  /**
+   * Forget what is owed for a session — a hand-back ended it, or another
+   * conversation took its place.
+   */
+  forget(sessionId: string): void {
+    if (this.expected.delete(sessionId)) logger.info(`relay: dropped the mirror owed for ${sessionId}`);
   }
 
   /** Send the accumulated answer (or say that there was none). */

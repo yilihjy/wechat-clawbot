@@ -277,7 +277,7 @@ export class InboundRouter {
           { mode: "relay", peer: sender },
         );
         const text = cancelled.ok
-          ? `已停《${stopTarget.title}》。接管还在，下一条消息继续进那个会话。`
+          ? `已停《${stopTarget.title || stopTarget.sessionId.replace(/^session-/u, "").slice(0, 8)}》。接管还在，下一条消息继续进那个会话。`
           : `停不了：${cancelled.message}`;
         await this.sendText(sender, text).catch(() => {});
         return;
@@ -315,6 +315,7 @@ export class InboundRouter {
         record,
         ...(this.stop === undefined ? {} : { stop: this.stop }),
         approve: (decision: "yes" | "no") => this.answerApproval(sender, decision),
+        forgetMirror: (sessionId: string) => this.relay?.forget(sessionId),
       }).catch((err: unknown) => `命令执行失败：${String((err as Error).message ?? err)}`);
       if (reply !== "") {
         // D13: a write command still runs while an approval is pending, but it
