@@ -228,6 +228,33 @@ const empty = await captureUrl(
 );
 check("a page with no text is not filed", empty.ok === false && empty.kind === "fetch");
 
+// WeChat's verification shell returns 200 with a little text — and must not be filed (D25).
+const beforeShell = calls.length;
+const shell = await captureUrl(
+  LONG,
+  CONFIG,
+  stub([
+    {
+      match: () => true,
+      reply: () =>
+        new Response(
+          '<html><head><title>微信公众平台</title></head><body><div class="weui-msg__title">环境异常</div><p>完成验证后即可继续访问。</p></body></html>',
+          { status: 200 },
+        ),
+    },
+  ]),
+);
+check("a verification shell is refused", shell.ok === false && shell.kind === "fetch");
+check("its receipt says verification is needed", captureReceipt(shell).includes("验证"));
+check("nothing was POSTed for it", calls.slice(beforeShell).every((call) => !call.url.endsWith("/captures")), JSON.stringify(calls.slice(beforeShell).map((c) => c.url)));
+
+const shellByUrl = await captureUrl(
+  "https://mp.weixin.qq.com/mp/wappoc_appmsgcaptcha?poc_token=abc&target_url=x",
+  CONFIG,
+  stub([{ match: () => true, reply: () => new Response("<html><body><div id=\"js_content\"><p>veri</p></div></body></html>", { status: 200 }) }]),
+);
+check("a captcha redirect is refused even with a body", shellByUrl.ok === false && shellByUrl.kind === "fetch");
+
 // Config, auth and transport failures each get their own receipt.
 const unconfigured = await captureUrl(LONG, { enabled: false, baseUrl: "x", token: "t" }, stub([{ match: () => true, reply: () => new Response("") }]));
 check("switched off is a config failure", unconfigured.ok === false && unconfigured.kind === "config");

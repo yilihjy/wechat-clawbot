@@ -279,6 +279,21 @@ export async function fetchPage(url: string, fetchImpl: FetchLike = fetch): Prom
   return { status: res.status, url: res.url === "" ? url : res.url, html: html.length > MAX_PAGE_BYTES ? "" : html };
 }
 
+/**
+ * Is this page WeChat's "prove you are human" shell rather than the article?
+ *
+ * Measured 2026-11-02: fetching the same link a few times in a row redirected to
+ * `mp.weixin.qq.com/mp/wappoc_appmsgcaptcha?poc_token=…&target_url=…`, which
+ * returns 200 with 38 characters of text and no title. Filing that would put a
+ * junk row in the inbox and lose the link (D25 says the opposite: a page we could
+ * not read is not an entry).
+ */
+export function isVerificationShell(page: FetchedPage): boolean {
+  if (/\/mp\/(wappoc_appmsgcaptcha|verify)|appmsgcaptcha/u.test(page.url)) return true;
+  const head = page.html.slice(0, 4_000);
+  return /环境异常|完成验证后即可继续访问|去验证|当前环境异常/u.test(head);
+}
+
 /** The shape `POST /api/v1/extension/captures` answers with (only the fields a receipt needs). */
 type CaptureResponse = {
   outcome?: string;
@@ -410,6 +425,9 @@ export async function captureUrl(
       url,
       message: `抓不到正文（HTTP ${page.status}${page.status === 412 ? "，公众号要验证" : ""}）`,
     };
+  }
+  if (isVerificationShell(page)) {
+    return { ok: false, kind: "fetch", url, message: "抓不到正文（公众号要求先验证，等一下再试）" };
   }
   const extracted = extractArticle(page.html, page.url);
   if (extracted.text.trim() === "") {
