@@ -360,7 +360,7 @@ v1 不写入工作台，桥自己留 90 天。
 把进程吊住；答完/撤销时清掉定时器，避免批准之后又冒出一句「审批超时」。
 `0` 仍然表示一直等（显式关掉这个行为）。
 
-### D52 发图失败：代理把微信 CDN 吞了（2026-11-03）
+### D52 发图失败：系统代理把微信 CDN 吞了（2026-11-03，17:50 修正结论）
 
 现象：重启后 `send_wechat_file` 连试四次全失败，回执是 `发送失败: fetch failed`；11-01 同样的动作是成功的。
 
@@ -372,18 +372,36 @@ v1 不写入工作台，桥自己留 90 天。
 带 HTTP(S)_PROXY + NODE_USE_ENV_PROXY 跑 node fetch → "fetch failed（Connect TimeoutError…:443）"
 ```
 
-也就是说：**DSH 是从一个带代理环境变量的终端启动的**。`@deepseek-ai/dsh-http-proxy` 会按启动环境
-装一个全局 undici dispatcher，于是插件里所有 `fetch` 都走代理——而那个代理到微信 CDN 通不了
-（API 主机 `ilinkai.weixin.qq.com` 它倒是能转发，所以文字消息正常，只有图/文件挂）。当前这个实例
-（12:09 由 Finder 拉起）环境里没有代理变量，所以现在应该能发。
+**第一版结论是错的**（当时写"从带代理的终端启动的"）。修正后的事实：
 
-两件事：
+- 12:09 那个实例的进程环境里**没有**任何代理变量（24 个变量逐个看过），但 `lsof` 显示它有
+  **到 127.0.0.1:15556 的已建立连接**——`lsof -nP -p <pid> -a -i TCP` 里四条连接全指着它；
+- `scutil --proxy`：macOS **系统代理**开着（HTTP/HTTPS/SOCKS 都是 127.0.0.1:15556，sing-box）；
+- DSH 的 `@deepseek-ai/dsh-http-proxy` 会按**它看得到的代理策略**装全局 undici dispatcher，
+  于是进程里所有 `fetch` 都走系统代理，跟启动环境无关。
 
-1. **回执要看得懂**：`fetch failed` 单独一句没有行动价值。`tool.ts` 现在把 cause 链带上，
-   同样的故障会显示 `fetch failed（Connect Timeout Error (attempted address: novac2c.cdn.weixin.qq.com:443…)）`。
-2. **别从带代理的终端启动 DSH**（或者把 `novac2c.cdn.weixin.qq.com` 加进 `NO_PROXY`）。
-   代码层面还有一条可选路：上传走 `node:https` 而不是 `fetch`（`node:https` 不看代理环境），
-   但那要重写重试与超时路径，先不做。
+所以"从终端启动"是错的方向，**系统代理才是**：它转发 `ilinkai.weixin.qq.com`（文字正常），
+但到 `novac2c.cdn.weixin.qq.com` 一直超时（`curl -x 15556` 实测 6 秒超时，直连 0.19 秒 400）。
+
+**入站那一半是同一个根因**：17:34 那张图也是走 CDN 下载，`fetch` 被代理吞掉、错误被
+`downloadMediaFromItem` 捕获后只写了一行日志，调用方拿到空结果——于是回了
+「收到视频消息，暂不支持处理」（把图片当成视频，还说"不支持"）。
+
+修法（两条腿都改）：
+
+1. **CDN 不再用 `fetch`**：新增 `src/ilink/cdn/cdn-http.ts`，用 `node:https` 直连——它不看系统代理，
+   也不看 undici 的全局 dispatcher；带 `AbortSignal.timeout` 硬截止（普通 socket timeout 只从
+   socket 建立后才算，DNS 卡住时等于没有）。上传（`cdn-upload.ts`）与下载（`pic-decrypt.ts`）
+   都走它。
+2. **失败要说出来**：`downloadMediaFromItem` 现在返回 `failure`（含 cause 链），`inbound.ts` 据此回
+   「图片没能下载：…」。那句"收到视频消息，暂不支持处理"改成按类型分：图片/文件、语音、视频各自一句。
+3. 回执也带上 cause：`fetch failed（Connect Timeout Error (attempted address: …)）`。
+
+**没做**：让 API 那几条腿（`getUploadUrl` / `sendmessage`）也绕开代理。它们通过代理是通的，
+而 WeChat 是境内服务，直连本来更合理；等真出问题再一起改。
+
+**验证**：`test/cdn-http.mjs`（20 条）——把代理变量指向死端口、并把 `fetch` 换成抛异常，
+传输仍然能对本地服务器完成请求；另外覆盖重定向、超时、体积上限、入站失败原因与文案分类。
 
 ### D49 审批：可追踪、会提醒、两边互斥（2026-11-03）
 

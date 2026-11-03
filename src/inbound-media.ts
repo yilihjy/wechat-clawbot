@@ -66,7 +66,22 @@ export type InboundMediaResult = {
   /** Local path of a downloaded/decrypted file attachment. */
   filePath?: string;
   mime?: string;
+  /**
+   * Why nothing was saved, when something was there but could not be fetched.
+   *
+   * Swallowing this is how a sent photo turned into "收到视频消息，暂不支持处理"
+   * (2026-11-03 17:34): the download failed, the caller saw an empty result and
+   * had no way to tell "no media" from "media that did not arrive".
+   */
+  failure?: string;
 };
+
+/** One readable line for a download failure, cause included. */
+function errorText(err: unknown): string {
+  if (!(err instanceof Error)) return String(err);
+  const cause = (err as Error & { cause?: unknown }).cause;
+  return cause === undefined ? err.message : `${err.message}（${String((cause as Error)?.message ?? cause)}）`;
+}
 
 /**
  * Download and decrypt media from a single MessageItem (image or file).
@@ -81,7 +96,13 @@ export async function downloadMediaFromItem(
 
   if (item.type === MessageItemType.IMAGE) {
     const img = item.image_item;
-    if (!img?.media?.encrypt_query_param && !img?.media?.full_url) return result;
+    if (!img?.media?.encrypt_query_param && !img?.media?.full_url) {
+      // The item exists but carries no way to fetch it. Rare, and worth a line:
+      // it is the difference between "WeChat sent nothing" and "we dropped it".
+      logger.warn(`${label} image: item has neither encrypt_query_param nor full_url (fields: ${Object.keys(img ?? {}).join(",")})`);
+      result.failure = "图片消息里没有下载地址";
+      return result;
+    }
     const aesKeyBase64 = img.aeskey
       ? Buffer.from(img.aeskey, "hex").toString("base64")
       : img.media.aes_key;
@@ -104,6 +125,7 @@ export async function downloadMediaFromItem(
       logger.debug(`${label} image saved: ${result.imagePath}`);
     } catch (err) {
       logger.error(`${label} image download/decrypt failed: ${String(err)}`);
+      result.failure = errorText(err);
     }
   } else if (item.type === MessageItemType.FILE) {
     const fileItem = item.file_item;
@@ -128,6 +150,7 @@ export async function downloadMediaFromItem(
       logger.debug(`${label} file: saved to ${result.filePath} mime=${mime}`);
     } catch (err) {
       logger.error(`${label} file download failed: ${String(err)}`);
+      result.failure = errorText(err);
     }
   }
 

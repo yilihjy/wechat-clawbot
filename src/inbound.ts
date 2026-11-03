@@ -95,6 +95,17 @@ function extractVoiceText(msg: WeixinMessage): string | null {
   return null;
 }
 
+/** What to say for a message the bridge cannot use at all. */
+export function unsupportedText(msg: WeixinMessage): string {
+  const kinds = new Set((msg.item_list ?? []).map((item) => item.type));
+  if (kinds.has(MessageItemType.IMAGE) || kinds.has(MessageItemType.FILE)) {
+    return "[DSH] 这条消息里没有可用的内容，附件也没拿到。再发一次试试。";
+  }
+  if (kinds.has(MessageItemType.VOICE)) return "[DSH] 语音消息没有转成文字，听不到内容。发文字或再发一次。";
+  if (kinds.has(MessageItemType.VIDEO)) return "[DSH] 收到视频消息，暂不支持处理。";
+  return "";
+}
+
 /** True when the message carries any item that is not plain text. */
 export function hasNonTextItem(msg: WeixinMessage): boolean {
   return (msg.item_list ?? []).some((item) => item.type !== MessageItemType.TEXT);
@@ -402,12 +413,17 @@ export class InboundRouter {
     // the user QUOTED (引用) inside a text reply.
     let mediaNote = "";
     let firstImagePath: string | undefined;
+    let mediaFailure = "";
     for (const item of msg.item_list ?? []) {
       if (item.type === MessageItemType.IMAGE || item.type === MessageItemType.FILE) {
         const media = await downloadMediaFromItem(item, {
           cdnBaseUrl: this.account.cdnBaseUrl,
           label: "inbound",
         });
+        if (media.failure !== undefined) {
+          mediaFailure = item.type === MessageItemType.IMAGE ? "图片" : "文件";
+          mediaFailure = `${mediaFailure}没能下载：${media.failure}`;
+        }
         if (media.imagePath) {
           firstImagePath ??= media.imagePath;
           mediaNote +=
@@ -444,12 +460,13 @@ export class InboundRouter {
     }
 
     if (!body && !mediaNote) {
-      if (hasNonTextItem(msg)) {
-        await this.sendText(
-          sender,
-          "[DSH] 收到视频消息，暂不支持处理。",
-        ).catch(() => {});
-      }
+      // Nothing usable came out of this message. Say which of the three things
+      // happened — it is not the same problem, and the old blanket line
+      // ("收到视频消息，暂不支持处理") was wrong for an image that failed to download.
+      const text = mediaFailure !== ""
+        ? `[DSH] ${mediaFailure}。再发一次试试。`
+        : unsupportedText(msg);
+      if (text !== "") await this.sendText(sender, text).catch(() => {});
       return;
     }
 

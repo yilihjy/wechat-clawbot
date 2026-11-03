@@ -1,30 +1,30 @@
 import { decryptAesEcb } from "./aes-ecb.js";
 import { buildCdnDownloadUrl, ENABLE_CDN_URL_FALLBACK } from "./cdn-url.js";
+import { cdnRequest } from "./cdn-http.js";
 import { logger } from "../util/logger.js";
 
 /**
  * Download raw bytes from the CDN (no decryption).
  */
 async function fetchCdnBytes(url: string, label: string): Promise<Buffer> {
-  let res: Response;
+  let res;
   try {
-    res = await fetch(url);
+    // Direct transport, not fetch: the host's fetch is proxied and that proxy
+    // cannot reach the WeChat CDN (see cdn-http.ts).
+    res = await cdnRequest(url, { timeoutMs: 60_000, maxBytes: 100 * 1024 * 1024 });
   } catch (err) {
-    const cause =
-      (err as NodeJS.ErrnoException).cause ?? (err as NodeJS.ErrnoException).code ?? "(no cause)";
-    logger.error(
-      `${label}: fetch network error url=${url} err=${String(err)} cause=${String(cause)}`,
-    );
+    const cause = (err as NodeJS.ErrnoException).cause ?? (err as NodeJS.ErrnoException).code ?? "(no cause)";
+    logger.error(`${label}: CDN network error url=${url} err=${String(err)} cause=${String(cause)}`);
     throw err;
   }
-  logger.debug(`${label}: response status=${res.status} ok=${res.ok}`);
-  if (!res.ok) {
-    const body = await res.text().catch(() => "(unreadable)");
-    const msg = `${label}: CDN download ${res.status} ${res.statusText} body=${body}`;
+  logger.debug(`${label}: response status=${res.status}`);
+  if (res.status < 200 || res.status >= 300) {
+    const body = res.body.toString("utf8").slice(0, 200) || "(empty)";
+    const msg = `${label}: CDN download ${res.status} body=${body}`;
     logger.error(msg);
     throw new Error(msg);
   }
-  return Buffer.from(await res.arrayBuffer());
+  return res.body;
 }
 
 /**
