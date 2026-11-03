@@ -237,6 +237,32 @@ export interface ClawbotConfig {
   /** Extension token with the `capture` scope (Bearer). Empty disables the path. */
   captureToken: string;
 
+  /**
+   * Say 「已收到，正在处理中」 when a message has been handed to the agent and
+   * nothing has come back yet (D51). 0 disables it.
+   *
+   * Not left to the model: the prompt already asks for a confirmation on slow
+   * tasks, and that is exactly what does NOT happen when the model is slow or
+   * stuck — the two moments the ack exists for.
+   */
+  ackAfterMs: number;
+
+  /**
+   * Re-send one line if a WeChat approval is still unanswered (D49). 0 disables.
+   *
+   * The card is a single text message among many: without a nudge it is easy to
+   * scroll past, and the turn waits for up to `approvalTimeoutMs`.
+   */
+  approvalReminderMs: number;
+
+  /**
+   * Directories `#新会话 <路径>` may create a session in (D50). `~` is expanded.
+   *
+   * Empty means "no path form at all". The workspace list (`#工作区`) is not
+   * affected — those are workspaces the owner already made on the desktop.
+   */
+  workspaceRoots: string[];
+
 
   /**
    * Pin the WeChat session to one model, independent of the deployment default.
@@ -304,6 +330,9 @@ export const DEFAULT_CONFIG: ClawbotConfig = {
   captureEnabled: false,
   captureBaseUrl: "http://127.0.0.1:4310",
   captureToken: "",
+  ackAfterMs: 4_000,
+  approvalReminderMs: 3 * 60_000,
+  workspaceRoots: ["~/workspace"],
 };
 
 function asStringArray(value: unknown): string[] {
@@ -330,6 +359,16 @@ export function normalizeConfig(raw?: Partial<ClawbotConfig> | Record<string, un
       typeof r.approvalTimeoutMs === "number" && Number.isFinite(r.approvalTimeoutMs)
         ? Math.max(0, r.approvalTimeoutMs)
         : DEFAULT_CONFIG.approvalTimeoutMs,
+    ackAfterMs:
+      typeof r.ackAfterMs === "number" && Number.isFinite(r.ackAfterMs)
+        ? Math.max(0, r.ackAfterMs)
+        : DEFAULT_CONFIG.ackAfterMs,
+    approvalReminderMs:
+      typeof r.approvalReminderMs === "number" && Number.isFinite(r.approvalReminderMs)
+        ? Math.max(0, r.approvalReminderMs)
+        : DEFAULT_CONFIG.approvalReminderMs,
+    workspaceRoots:
+      Array.isArray(r.workspaceRoots) ? asStringArray(r.workspaceRoots) : DEFAULT_CONFIG.workspaceRoots,
     botAgent:
       typeof r.botAgent === "string" && r.botAgent.trim()
         ? r.botAgent.trim()
@@ -551,6 +590,17 @@ export const BaseConfig = Schema.object({
       "审批类问题等微信回答多久(毫秒),默认 30 分钟:超时就撤掉这张卡、微信回一句「审批超时,这一轮已停」。"
       + "因为无人回答的审批会一直挂着那个回合(接管中的会话也会被挂住)。0 = 一直等",
     ),
+  ackAfterMs: Schema.number()
+    .default(4_000)
+    .min(0)
+    .description("消息交给 agent 后多久还没回复,就回一句「已收到,正在处理中」。0 = 不回执"),
+  approvalReminderMs: Schema.number()
+    .default(3 * 60_000)
+    .min(0)
+    .description("微信侧审批卡片多久没人答就补一条提醒(毫秒)。0 = 不提醒;超时仍按 approvalTimeoutMs 处理"),
+  workspaceRoots: Schema.array(Schema.string())
+    .default(["~/workspace"])
+    .description("「#新会话 <路径>」允许建会话的目录(支持 ~)。留空 = 不允许用路径形式"),
   logLevel: Schema.union(["debug", "info", "warn", "error"] as const)
     .default("info")
     .description("协议层日志级别"),
@@ -631,6 +681,9 @@ export const HOT_FIELDS = new Set<keyof ClawbotConfig>([
   "compressThresholdBytes",
   "noticeMinBytes",
   "approvalTimeoutMs",
+  "ackAfterMs",
+  "approvalReminderMs",
+  "workspaceRoots",
   "logLevel",
   // Read fresh on each send, so changing it takes effect on the next message.
   "claudeResumePermissionMode",

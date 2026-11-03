@@ -11,6 +11,7 @@ import type { ApprovalOutcome, ApprovalRequest } from "@deepseek-ai/dsh-user-app
 
 import type { ClawbotConfig } from "./config.js";
 import type { WechatBridge } from "./bridge.js";
+import type { CommandLedger } from "./ledger.js";
 import { PendingRegistry } from "./pending.js";
 import { isFresh, type ModeStore, type RelayBinding } from "./modes.js";
 import { logger } from "./ilink/util/logger.js";
@@ -93,6 +94,9 @@ export class ApprovalRelay {
   private readonly pending: PendingRegistry;
   private readonly sendText: (to: string, text: string) => Promise<void>;
   private readonly modes: ModeStore | undefined;
+  private readonly ledger: CommandLedger | undefined;
+  private readonly wasStoppedRecently: ((sessionId: string) => boolean) | undefined;
+  private readonly reminderMs: () => number;
 
   constructor(deps: {
     config: ClawbotConfig;
@@ -102,12 +106,21 @@ export class ApprovalRelay {
     sendText: (to: string, text: string) => Promise<void>;
     /** Where the relayed conversations are (absent only in compositions without relay). */
     modes?: ModeStore;
+    /** The command ledger: every approval is recorded there (D49). */
+    ledger?: CommandLedger;
+    /** Whether that session was stopped by `#停一下` a moment ago (suppresses the "handled on the desktop" line). */
+    wasStoppedRecently?: (sessionId: string) => boolean;
+    /** Live read of the reminder delay, so a settings change needs no restart. */
+    reminderMs?: () => number;
   }) {
     this.config = deps.config;
     this.getBridge = deps.getBridge;
     this.pending = deps.pending;
     this.sendText = deps.sendText;
     this.modes = deps.modes;
+    this.ledger = deps.ledger;
+    this.wasStoppedRecently = deps.wasStoppedRecently;
+    this.reminderMs = deps.reminderMs ?? (() => 0);
   }
 
   /** Register the `approval/request` waterfall listener on the root context. */
@@ -148,26 +161,35 @@ export class ApprovalRelay {
       `请回复：#允许 / #拒绝`;
     // <<< local
 
+    const routeKind = route.kind === "relay" ? "relay" : "wechat";
+    const who = route.kind === "relay" ? `《${route.title.trim() || "接管中的会话"}》` : "微信会话";
     try {
       await this.sendText(sender, question);
       // Answering a prompt keeps the relay window open: the owner is on the phone.
       if (route.kind === "relay") this.modes?.touch(sender);
     } catch (err) {
       logger.error(`approval: failed to send question to ${sender}: ${String(err)}`);
+      this.record("failed", `没能把审批发到微信：${String(err).slice(0, 80)}`, { tool: req.toolName, route: routeKind, stage: "send" });
       return "unavailable";
     }
+    // D49: the card is one text message in a chat stream; record that it went
+    // out, so "did I get a card?" stops being a question nobody can answer.
+    this.record("ok", `发出审批（${who}）：${req.toolName}`, { tool: req.toolName, route: routeKind, stage: "sent" });
     // The send can take seconds. If the turn was stopped meanwhile, the abort
     // already fired and a listener added now would never run — the entry would
     // then sit in the queue and swallow the owner's next message.
     if (req.signal?.aborted) return "cancelled";
 
+    const askedAt = Date.now();
     return new Promise<ApprovalOutcome>((resolveOutcome) => {
       let settled = false;
       let timer: ReturnType<typeof setTimeout> | undefined;
+      let reminder: ReturnType<typeof setTimeout> | undefined;
       const settle = (outcome: ApprovalOutcome): void => {
         if (settled) return;
         settled = true;
         if (timer !== undefined) clearTimeout(timer);
+        if (reminder !== undefined) clearTimeout(reminder);
         resolveOutcome(outcome);
       };
 
@@ -183,6 +205,13 @@ export class ApprovalRelay {
           }
           const decision = parseApprovalReply(reply);
           void this.sendText(sender, decision === "yes" ? "已批准。" : "已拒绝。").catch(() => {});
+          this.record("ok", `已在微信${decision === "yes" ? "批准" : "拒绝"}：${req.toolName}`, {
+            tool: req.toolName,
+            route: routeKind,
+            stage: "answered",
+            decision,
+            waitedMs: Date.now() - askedAt,
+          });
           settle(decision === "yes" ? "allowed-once" : "rejected");
         },
       };
@@ -201,10 +230,49 @@ export class ApprovalRelay {
         this.pending.remove(answer);
         if (reason === "timeout") {
           void this.sendText(sender, "审批超时，这一轮已停。").catch(() => {});
+          this.record("noop", `没人答，超时作废：${req.toolName}`, {
+            tool: req.toolName,
+            route: routeKind,
+            stage: "timeout",
+            waitedMs: Date.now() - askedAt,
+          });
+        } else {
+          // The turn was aborted. Two very different things land here: the owner
+          // stopped it with `#停一下` (already answered on the phone — say
+          // nothing), or it was handled on the desktop (the phone otherwise
+          // never learns that the waiting is over). D49 records which, and only
+          // the desktop case gets a line.
+          const stopped = this.wasStoppedRecently?.(String(req.agent.id)) === true;
+          this.record("noop", stopped ? `这一轮被 #停一下 停了：${req.toolName}` : `在电脑上处理掉了：${req.toolName}`, {
+            tool: req.toolName,
+            route: routeKind,
+            stage: stopped ? "stopped" : "elsewhere",
+            waitedMs: Date.now() - askedAt,
+          });
+          if (!stopped) {
+            void this.sendText(sender, "这条审批已经在电脑上处理了。").catch(() => {});
+          }
         }
         settle("cancelled");
       };
       req.signal?.addEventListener("abort", () => withdraw("aborted"), { once: true });
+
+      // D49: one nudge. A card scrolled past is indistinguishable from a card
+      // never sent — and the turn waits up to `approvalTimeoutMs` either way.
+      const reminderMs = this.reminderMs();
+      if (reminderMs > 0) {
+        reminder = setTimeout(() => {
+          if (settled) return;
+          void this.sendText(sender, `还在等：#允许 / #拒绝（${req.toolName}）`).catch(() => {});
+          this.record("noop", `补了一次提醒：${req.toolName}`, {
+            tool: req.toolName,
+            route: routeKind,
+            stage: "reminded",
+            waitedMs: Date.now() - askedAt,
+          });
+        }, reminderMs);
+        reminder.unref?.();
+      }
 
       const timeoutMs = this.config.approvalTimeoutMs;
       if (timeoutMs > 0) {
@@ -213,5 +281,25 @@ export class ApprovalRelay {
         timer.unref?.();
       }
     });
+  }
+
+  /**
+   * File one step of an approval's life in the command ledger (D49).
+   *
+   * An approval is not a command, but it is the one interaction whose delivery
+   * the owner cannot verify by looking at the chat: "did the card arrive, was
+   * it ever answered, did the desktop eat it?" needs a record or it stays a
+   * guess. Never throws: a full disk must not block an approval.
+   */
+  private record(
+    result: "ok" | "noop" | "failed",
+    summary: string,
+    args: Record<string, unknown>,
+  ): void {
+    try {
+      this.ledger?.append({ command: "审批", args, result, summary }, { mode: "agent", peer: "" });
+    } catch {
+      // ignore: the approval itself matters more than its record
+    }
   }
 }

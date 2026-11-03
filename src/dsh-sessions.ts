@@ -89,8 +89,8 @@ type SessionControllerLike = {
    * have it, and the caller falls back to `sessionQuery`.
    */
   list?: (request: unknown, signal: AbortSignal) => Promise<{ items: ControllerSummary[] }>;
-  /** Create a conversation (`#新会话`). */
-  create?: (request: { cwd?: string; sessionId?: unknown }) => Promise<{ sessionId: unknown }>;
+  /** Create a conversation (`#新会话`), in a directory or in a workspace. */
+  create?: (request: { cwd?: string; workspaceId?: unknown; sessionId?: unknown }) => Promise<{ sessionId: unknown }>;
   /** Cancel the active turn without dropping the queue (`#停一下`). */
   cancel?: (request: { sessionId: unknown }) => { accepted: boolean };
   /** Switch one conversation's model (`#模型 N`). */
@@ -365,20 +365,62 @@ export async function sendToDshSession(
  */
 export async function createDshSession(
   ctx: Context,
-  cwd?: string,
+  options: { cwd?: string; workspaceId?: string } = {},
 ): Promise<{ ok: true; sessionId: string } | { ok: false; message: string }> {
   const controller = sessionController(ctx);
   if (controller?.create === undefined) {
     return { ok: false, message: "这个 DSH 没有 sessionController.create，不能从外部新建会话" };
   }
   try {
-    const created = await controller.create(cwd === undefined ? {} : { cwd });
+    // A workspace keeps the conversation in the sidebar group the owner picked;
+    // a bare cwd is the fallback for a directory that has no workspace record.
+    const request: { cwd?: string; workspaceId?: unknown } =
+      options.workspaceId !== undefined ? { workspaceId: options.workspaceId } : {};
+    if (options.workspaceId === undefined && options.cwd !== undefined) request.cwd = options.cwd;
+    const created = await controller.create(request);
     const sessionId = String(created.sessionId ?? "");
     if (sessionId === "") return { ok: false, message: "宿主返回了空会话 id" };
-    logger.info(`dsh create: new session ${sessionId}${cwd === undefined ? "" : ` in ${cwd}`}`);
+    const where = options.workspaceId !== undefined ? `workspace ${options.workspaceId}` : options.cwd ?? "(宿主默认)";
+    logger.info(`dsh create: new session ${sessionId} in ${where}`);
     return { ok: true, sessionId };
   } catch (err) {
     return { ok: false, message: String((err as Error)?.message ?? err).slice(0, 200) };
+  }
+}
+
+/** One workspace from the desktop's sidebar list (D50). */
+export type WorkspaceRow = { readonly id: string; readonly title: string; readonly path: string };
+
+/** The part of the host's `workspaceRegistry` service this plugin uses. */
+type WorkspaceRegistryLike = {
+  list?: () => ReadonlyArray<{ id: unknown; title?: unknown; path?: unknown }>;
+};
+
+/**
+ * The workspaces the owner already made on the desktop, in sidebar order.
+ *
+ * This is the list `#工作区` prints and `#新会话 N` indexes into: reusing it means
+ * a phone-created conversation lands where the owner expects it instead of in a
+ * separate space of its own. `undefined` when the composition has no registry
+ * (headless), which the caller reports rather than pretending the list is empty.
+ */
+export function listWorkspaces(ctx: Context): WorkspaceRow[] | undefined {
+  let registry: WorkspaceRegistryLike | undefined;
+  try {
+    registry = ctx.get("workspaceRegistry") as WorkspaceRegistryLike | undefined;
+  } catch {
+    registry = undefined;
+  }
+  if (registry?.list === undefined) return undefined;
+  try {
+    return registry.list().map((item) => ({
+      id: String(item.id),
+      title: typeof item.title === "string" && item.title.trim() !== "" ? item.title : String(item.path ?? ""),
+      path: String(item.path ?? ""),
+    }));
+  } catch (err) {
+    logger.warn(`dsh workspaces: list failed: ${String(err).slice(0, 160)}`);
+    return undefined;
   }
 }
 

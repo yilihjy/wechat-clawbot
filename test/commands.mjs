@@ -99,7 +99,7 @@ const controllerCtx = {
   agents: { list: () => [] },
   get: (name) => (name === "sessionController" ? { resolveAgent: async () => ({}), list: async () => ({ items: CONTROLLER_ITEMS }) } : undefined),
 };
-const { renderStatus } = await import(join(ROOT, "lib/commands.js"));
+const { renderStatus, resolveWorkspacePath } = await import(join(ROOT, "lib/commands.js"));
 const status = await renderStatus({ ctx: controllerCtx, sessionId: "wechat-main" });
 check("the running conversation comes first", /1\. 打通微信和DSH/u.test(status), status);
 check("a newer-but-idle conversation is ordered by activity, not creation", status.indexOf("创建更晚") > status.indexOf("打通微信和DSH"), status);
@@ -345,6 +345,82 @@ check("#允许 while a question waits does not answer it", (await run("#允许",
   });
   check("#新会话 forgets the previous conversation's mirror", forgotten.includes("session-beta"), forgotten.join(","));
   store.release("wxid_me");
+}
+
+// ---------------------------------------------------------------- workspaces (D50)
+
+{
+  // #工作区 lists the desktop's workspaces, numbered for #新会话 N.
+  const workspaceCtx = {
+    agents: { list: () => [] },
+    get: (name) =>
+      name === "workspaceRegistry"
+        ? {
+            list: () => [
+              { id: "ws-1", title: "global-seo", path: "/Users/someone/workspace/global-seo" },
+              { id: "ws-2", title: "wechat-clawbot", path: "/Users/someone/workspace/wechat-clawbot" },
+            ],
+          }
+        : name === "sessionController"
+          ? { resolveAgent: async () => ({}) }
+          : undefined,
+  };
+  const listedWorkspaces = await run("#工作区", { ctx: workspaceCtx });
+  check("#工作区 numbers the workspaces", /1\. global-seo/u.test(listedWorkspaces) && /2\. wechat-clawbot/u.test(listedWorkspaces), listedWorkspaces);
+  check("#工作区 points at #新会话 N", listedWorkspaces.includes("#新会话 N"), listedWorkspaces);
+
+  let createdWith = null;
+  const managerCtx = {
+    agents: { list: () => [] },
+    get: (name) =>
+      name === "workspaceRegistry"
+        ? { list: () => [{ id: "ws-1", title: "global-seo", path: "/tmp/global-seo" }] }
+        : name === "sessionController"
+          ? { resolveAgent: async () => ({}), create: async (request) => { createdWith = request; return { sessionId: "session-ws" }; } }
+          : undefined,
+  };
+  store.release("wxid_me");
+  const createdReply = await run("#新会话 1", { ctx: managerCtx, cwd: "/tmp/elsewhere" });
+  check("#新会话 N creates inside that workspace", createdWith?.workspaceId === "ws-1", JSON.stringify(createdWith));
+  check("#新会话 N does not pass a cwd", createdWith?.cwd === undefined, JSON.stringify(createdWith));
+  check("#新会话 N takes it over", store.lookup("wxid_me").binding?.sessionId === "session-ws");
+  check("#新会话 N names the workspace", createdReply.includes("global-seo"), createdReply);
+  check("#新会话 9 is refused", (await run("#新会话 9", { ctx: managerCtx })).includes("没有第 9 个"));
+  store.release("wxid_me");
+
+  // A path form, inside the configured roots only.
+  const { mkdtempSync: mkTmp, mkdirSync: mkDir, writeFileSync: writeTmp, rmSync: rmTmp } = await import("node:fs");
+  const { tmpdir: tmpOs, homedir: homeOs } = await import("node:os");
+  const root = mkTmp(join(tmpOs(), "clawbot-ws-"));
+  const project = join(root, "project-a");
+  mkDir(project);
+  writeTmp(join(root, "a-file"), "x");
+
+  createdWith = null;
+  const pathReply = await run(`#新会话 ${project}`, {
+    ctx: managerCtx,
+    workspaceRoots: [root],
+  });
+  check("#新会话 <路径> passes that directory", createdWith?.cwd === project, JSON.stringify(createdWith));
+  check("#新会话 <路径> reports the directory", pathReply.includes("project-a"), pathReply);
+  store.release("wxid_me");
+
+  const outside = await run(`#新会话 ${tmpOs()}`, { ctx: managerCtx, workspaceRoots: [root] });
+  check("a path outside the roots is refused", outside.includes("只能在这些目录下开"), outside);
+  const noRoots = await run(`#新会话 ${project}`, { ctx: managerCtx, workspaceRoots: [] });
+  check("no roots means no path form", noRoots.includes("没有配置 workspaceRoots"), noRoots);
+  const missing = await run(`#新会话 ${join(root, "does-not-exist")}`, { ctx: managerCtx, workspaceRoots: [root] });
+  check("a missing directory is refused", missing.includes("没有这个目录"), missing);
+
+  // The resolver itself: ~ expansion, absolute-only, files vs directories.
+  check("a directory inside the root resolves", resolveWorkspacePath(root, [root]).ok === true);
+  check("a file is refused", resolveWorkspacePath(join(root, "a-file"), [root]).ok === false);
+  check("a relative path is refused", resolveWorkspacePath("relative/dir", [root]).ok === false);
+  const outsideRoot = resolveWorkspacePath(tmpOs(), [root]);
+  check("another directory is refused", outsideRoot.ok === false && outsideRoot.message.includes("只能在这些目录下开"));
+  const tilde = resolveWorkspacePath("~", ["~"]);
+  check("~ expands to the home directory", tilde.ok === true && tilde.path === homeOs(), JSON.stringify(tilde));
+  rmTmp(root, { recursive: true, force: true });
 }
 
 // ---------------------------------------------------------------- the ledger (D28)

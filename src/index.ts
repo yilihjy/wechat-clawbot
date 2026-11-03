@@ -50,7 +50,8 @@ import { setLogLevel, logger } from "./ilink/util/logger.js";
 import { registerWorkspaceInstructionsFilter } from "./workspace-instructions.js";
 import { ModeStore } from "./modes.js";
 import { CommandLedger } from "./ledger.js";
-import { StopConfirms } from "./stop.js";
+import { ACK_TICK_MS, AckQueue } from "./ack.js";
+import { RecentStops, StopConfirms } from "./stop.js";
 import { registerTimelineRoute } from "./timeline.js";
 import { RelayService } from "./relay.js";
 import { sendToDshSession } from "./dsh-sessions.js";
@@ -257,6 +258,10 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
   const ledger = new CommandLedger({ dir: path.join(resolveStateDir(), "ledger") });
   /** `#停一下` in relay mode asks once; this remembers the question (D14). */
   const stops = new StopConfirms();
+  /** Sessions stopped a moment ago, so an abort is not misread as a desktop answer (D49). */
+  const recentStops = new RecentStops();
+  /** 「已收到，正在处理中…」per peer (D51); the delay is read live from config. */
+  const acks = new AckQueue(() => config.ackAfterMs);
   // <<< local
   const codexProgress = new CodexProgressStore();
   /** Messages WeChat would not take yet; shared by the bridge and the MCP notify route. */
@@ -338,6 +343,8 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
   /** Send a text message back to one WeChat user through the bound account. */
   const sendText = async (to: string, text: string): Promise<void> => {
     if (!currentAccount?.configured) throw new Error("no bound WeChat account");
+    // Anything the bot says means the phone is no longer waiting in silence (D51).
+    acks.cancel(to);
     // Bracket codes go either way — see src/emoji.ts.
     const finalText = config.stripEmoji ? stripEmoji(text) : stripWechatCodes(text);
     if (!finalText) return;
@@ -351,6 +358,25 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
         timeoutMs: 15_000,
       },
     });
+  };
+
+  /**
+   * D51: one receipt per burst, only when the answer is slow.
+   *
+   * The ticker exists only while something is armed; `unref` so a pending
+   * receipt never keeps the process (or a shutdown) alive.
+   */
+  let ackTick: ReturnType<typeof setInterval> | undefined;
+  const ensureAckTick = (): void => {
+    if (ackTick !== undefined) return;
+    ackTick = setInterval(() => {
+      for (const item of acks.due(Date.now())) void sendText(item.peer, item.text).catch(() => {});
+      if (acks.size === 0 && ackTick !== undefined) {
+        clearInterval(ackTick);
+        ackTick = undefined;
+      }
+    }, ACK_TICK_MS);
+    ackTick.unref?.();
   };
 
   // >>> local: relay（D2/D15/D18）
@@ -389,6 +415,8 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
       return sent.ok ? { ok: true } : { ok: false, message: sent.message };
     },
     sendFile: async (to, name, text) => {
+      // A file IS the answer: the phone is not waiting in silence any more (D51).
+      acks.cancel(to);
       const file = path.join(resolveStateDir(), "outbox", name);
       fs.mkdirSync(path.dirname(file), { recursive: true });
       fs.writeFileSync(file, text, { encoding: "utf-8", mode: 0o600 });
@@ -486,6 +514,7 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
       // Kept inline (not the shared sendFileTo above) because a regression check
       // evaluates this exact source slice with only the names it destructures.
       sendFile: async (to, file) => {
+        acks.cancel(to);
         const bound = currentAccount;
         if (!bound?.configured) return { ok: false, windowClosed: false, permanent: false, message: "no bound WeChat account" };
         return uploadFileTo({
@@ -510,6 +539,9 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
       modes,
       ledger,
       stop: stops,
+      recentStops,
+      acks,
+      onArmAck: ensureAckTick,
       ...(relays === null ? {} : { relay: relays }),
     });
 
@@ -621,6 +653,9 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
     pending,
     sendText,
     modes,
+    ledger,
+    wasStoppedRecently: (sessionId: string) => recentStops.has(sessionId, Date.now()),
+    reminderMs: () => config.approvalReminderMs,
   });
   relay.register(ctx);
 
@@ -675,6 +710,9 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
     claim.release();
     watcher.close();
     codexPeer.close();
+    if (ackTick !== undefined) clearInterval(ackTick);
+    ackTick = undefined;
+    acks.clear();
     await stopMonitor("plugin unload");
   };
 }

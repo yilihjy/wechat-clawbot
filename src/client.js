@@ -953,6 +953,45 @@ window.__ModuleLoader__.load({
           }),
         }),
         Field({
+          label: "处理中回执",
+          hint: "秒。消息交给 agent 后这么久还没回复,就回一句「已收到,正在处理中」。0 = 不回执",
+          overridden: isSet("ackAfterMs"), disabled,
+          onReset: () => clear("ackAfterMs"),
+          control: h("input", {
+            type: "number", className: S.input, min: 0, disabled,
+            value: v.ackAfterMs === undefined ? "" : v.ackAfterMs / 1000,
+            placeholder: "4",
+            onChange: (e) => num("ackAfterMs", e.target.value, 1000),
+          }),
+        }),
+        Field({
+          label: "审批提醒",
+          hint: "秒。微信里的审批卡片这么久没人答就补一条提醒。0 = 不提醒",
+          overridden: isSet("approvalReminderMs"), disabled,
+          onReset: () => clear("approvalReminderMs"),
+          control: h("input", {
+            type: "number", className: S.input, min: 0, disabled,
+            value: v.approvalReminderMs === undefined ? "" : v.approvalReminderMs / 1000,
+            placeholder: "180",
+            onChange: (e) => num("approvalReminderMs", e.target.value, 1000),
+          }),
+        }),
+        Field({
+          label: "新会话允许的目录",
+          hint: "「#新会话 <路径>」只能在这些目录下开会话。一行一个,支持 ~。留空 = 不允许用路径",
+          overridden: isSet("workspaceRoots"), disabled,
+          onReset: () => clear("workspaceRoots"),
+          control: h("textarea", {
+            className: S.area, disabled,
+            defaultValue: Array.isArray(v.workspaceRoots) ? v.workspaceRoots.join("\n") : "",
+            placeholder: "~/workspace",
+            onBlur: (e) => {
+              const roots = String(e.target.value).split(/[\n,]+/).map((s) => s.trim()).filter(Boolean);
+              if (roots.length === 0) clear("workspaceRoots"); else set("workspaceRoots", roots);
+            },
+          }),
+        }),
+        Field({
           label: "日志级别", hint: "协议层日志的详细程度",
           overridden: isSet("logLevel"), disabled,
           onReset: () => clear("logLevel"),

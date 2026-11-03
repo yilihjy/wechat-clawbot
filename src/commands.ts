@@ -13,6 +13,8 @@
  * - `> ` escapes: the marker is stripped and the rest goes to the agent verbatim,
  *   which is how a literal command name is still sayable.
  */
+import fs from "node:fs";
+import { homedir } from "node:os";
 import path from "node:path";
 
 import type { Context } from "@deepseek-ai/cordis";
@@ -23,6 +25,7 @@ import {
   cancelDshSession,
   createDshSession,
   listDshSessions,
+  listWorkspaces,
   readDshSession,
   readModelCatalog,
   selectDshModel,
@@ -51,7 +54,10 @@ const HELP: ReadonlyArray<readonly [name: string, summary: string]> = [
   ["#任务状态 N", "展开第 N 个"],
   ["#接管 N", "让第 N 个会话临时变成微信的前端"],
   ["#交还", "结束接管，回到专属 agent"],
-  ["#新会话", "新建一个会话并直接接管"],
+  ["#新会话", "新建一个会话并直接接管（用配置里的工作区）"],
+  ["#新会话 N", "在第 N 个工作区新建并接管"],
+  ["#新会话 <路径>", "在指定目录新建并接管"],
+  ["#工作区", "桌面上的工作区清单"],
   ["#入库 <链接>", "把一条链接存进工作台收件箱"],
   ["#停一下", "打断当前回合（接管中会先问一句）"],
   ["#允许", "批准挂着的权限请求"],
@@ -150,10 +156,16 @@ export interface CommandDeps {
   readonly note?: (text: string) => void;
   /** File every command in the ledger (D28); a missing ledger is not an error. */
   readonly record?: (draft: LedgerDraft) => void;
+  /** Directories `#新会话 <路径>` may use (D50); empty disables the path form. */
+  readonly workspaceRoots?: readonly string[];
   /** The relay confirmation window `#停一下` opens (D14). */
   readonly stop?: StopConfirms;
   /** Answer a pending approval from a command (D12). */
   readonly approve?: (decision: "yes" | "no") => "answered" | "question" | "none";
+  /** Note that this session was just stopped, so an abort is explained (D49). */
+  readonly noteStop?: (sessionId: string) => void;
+  /** Drop the pending 「已收到」receipt for this peer (D51). */
+  readonly cancelAck?: () => void;
   /** Drop a mirror the relay still owes for a conversation that lost its binding. */
   readonly forgetMirror?: (sessionId: string) => void;
 }
@@ -221,7 +233,9 @@ export async function runCommand(routed: Routed, deps: CommandDeps): Promise<str
     case "停一下":
       return stopCommand(deps);
     case "新会话":
-      return newSession(deps);
+      return newSession(deps, routed.arg);
+    case "工作区":
+      return workspacesText(deps);
     case "模型":
       return modelCommand(deps, routed.arg);
     case "允许":
@@ -345,14 +359,95 @@ function stopCommand(deps: CommandDeps): string {
     record(deps, { command: "停一下", result: "failed", summary: cancelled.message });
     return `停不了：${cancelled.message}`;
   }
+  deps.noteStop?.(deps.sessionId);
+  deps.cancelAck?.();
   record(deps, { command: "停一下", result: "ok", summary: "停了当前回合" });
   return "已停。下一条消息重新开始。";
 }
 
-/** `#新会话` — create a conversation and take it over in one step (Q1/D10). */
-async function newSession(deps: CommandDeps): Promise<string> {
+/** Expand `~` and check a directory may host a new conversation (D50). */
+export function resolveWorkspacePath(
+  raw: string,
+  roots: readonly string[],
+): { ok: true; path: string } | { ok: false; message: string } {
+  const trimmed = raw.trim();
+  if (trimmed === "") return { ok: false, message: "用法：#新会话 <路径>（或 #新会话 N，N 是「#工作区」里的编号）" };
+  const expanded = trimmed === "~" || trimmed.startsWith("~/")
+    ? path.join(homedir(), trimmed.slice(1))
+    : trimmed;
+  const resolved = path.resolve(expanded);
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(resolved);
+  } catch {
+    return { ok: false, message: `没有这个目录：${shortPath(resolved)}` };
+  }
+  if (!stat.isDirectory()) return { ok: false, message: `这不是目录：${shortPath(resolved)}` };
+  if (roots.length === 0) {
+    return { ok: false, message: "没有配置 workspaceRoots：只能用「#新会话 N」在桌面已有的工作区里开会话" };
+  }
+  const inside = roots
+    .map((root) => path.resolve(root === "~" ? homedir() : root.startsWith("~/") ? path.join(homedir(), root.slice(1)) : root))
+    .some((root) => resolved === root || resolved.startsWith(`${root}${path.sep}`));
+  if (!inside) {
+    return {
+      ok: false,
+      message: `只能在这些目录下开：${roots.map((root) => shortPath(root)).join("、")}；${shortPath(resolved)} 不在里面`,
+    };
+  }
+  return { ok: true, path: resolved };
+}
+
+/** `#工作区` — the desktop's workspace list, numbered for `#新会话 N` (D50). */
+function workspacesText(deps: CommandDeps): string {
+  const listed = listWorkspaces(deps.ctx);
+  if (listed === undefined) return "读不到工作区列表（这个 DSH 没有 workspaceRegistry）。";
+  record(deps, { command: "工作区", result: "ok", summary: `看了 ${listed.length} 个工作区` });
+  if (listed.length === 0) return "桌面里还没有工作区。可以在桌面新建一个，或用「#新会话 <路径>」。";
+  const lines = [`工作区 ${listed.length} 个：`];
+  listed.forEach((workspace, index) => {
+    lines.push(`${index + 1}. ${workspace.title} · ${shortPath(workspace.path)}`);
+  });
+  lines.push("", "#新会话 N 在那里新建会话并直接接管。");
+  return lines.join("\n");
+}
+
+/**
+ * `#新会话 [N | 路径]` — create a conversation and take it over in one step.
+ *
+ * Three shapes (D50): no argument keeps the old behaviour (the configured cwd),
+ * a number picks a workspace from `#工作区`, and a path names a directory — the
+ * last one only inside `workspaceRoots`, because a phone message should not be
+ * able to open a conversation anywhere on this disk.
+ */
+async function newSession(deps: CommandDeps, arg = ""): Promise<string> {
   if (deps.modes === undefined || deps.peer === undefined) return "接管功能没接上（缺少模式存储）。";
-  const created = await createDshSession(deps.ctx, deps.cwd);
+  let cwd: string | undefined;
+  let workspaceId: string | undefined;
+  let where = deps.cwd === undefined ? "宿主默认（设置里填 cwd 才会变）" : shortPath(deps.cwd);
+  if (arg !== "" && /^\d+$/u.test(arg)) {
+    const listed = listWorkspaces(deps.ctx);
+    if (listed === undefined) return "读不到工作区列表（这个 DSH 没有 workspaceRegistry）。";
+    const index = Number.parseInt(arg, 10);
+    if (index < 1 || index > listed.length) return `没有第 ${index} 个工作区。发「#工作区」看清单。`;
+    const workspace = listed[index - 1]!;
+    workspaceId = workspace.id;
+    where = `${workspace.title}（${shortPath(workspace.path)}）`;
+  } else if (arg !== "") {
+    const resolved = resolveWorkspacePath(arg, deps.workspaceRoots ?? []);
+    if (!resolved.ok) {
+      record(deps, { command: "新会话", args: { path: arg }, result: "failed", summary: resolved.message });
+      return resolved.message;
+    }
+    cwd = resolved.path;
+    where = shortPath(resolved.path);
+  } else {
+    cwd = deps.cwd;
+  }
+  const created = await createDshSession(deps.ctx, {
+    ...(workspaceId === undefined ? {} : { workspaceId }),
+    ...(cwd === undefined ? {} : { cwd }),
+  });
   if (!created.ok) {
     record(deps, { command: "新会话", result: "failed", summary: created.message });
     return `新建会话失败：${created.message}`;
@@ -366,13 +461,12 @@ async function newSession(deps: CommandDeps): Promise<string> {
   );
   record(deps, {
     command: "新会话",
-    args: { sessionId: created.sessionId },
+    args: { sessionId: created.sessionId, ...(workspaceId === undefined ? {} : { workspaceId }), ...(cwd === undefined ? {} : { cwd }) },
     result: "ok",
-    summary: `新建并接管 ${shortSessionId(created.sessionId)}`,
+    summary: `新建并接管 ${shortSessionId(created.sessionId)}${where ? `（${where}）` : ""}`,
     // A conversation that did not exist before has nothing to go back to.
     undo: null,
   });
-  const where = deps.cwd === undefined ? "宿主默认（设置里填 cwd 才会变）" : shortPath(deps.cwd);
   return [
     "已新建会话并接管。",
     `id: ${created.sessionId}`,

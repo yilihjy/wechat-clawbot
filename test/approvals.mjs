@@ -119,12 +119,16 @@ const { normalizeConfig } = await import(join(ROOT, "lib/config.js"));
 // turn — and a relayed conversation's turn on the desktop too.
 equal("the default approval timeout is 30 minutes", normalizeConfig({}).approvalTimeoutMs, 30 * 60_000);
 equal("an explicit 0 still means wait forever", normalizeConfig({ approvalTimeoutMs: 0 }).approvalTimeoutMs, 0);
+equal("the reminder waits 3 minutes by default", normalizeConfig({}).approvalReminderMs, 3 * 60_000);
+equal("the reminder can be turned off", normalizeConfig({ approvalReminderMs: 0 }).approvalReminderMs, 0);
+equal("receipts are on by default (4s)", normalizeConfig({}).ackAfterMs, 4_000);
+equal("the path form of #新会话 is limited to ~/workspace", normalizeConfig({}).workspaceRoots, ["~/workspace"]);
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 // The relay unrefs its timeout timer so it can never hold DSH open. In this
 // harness nothing else does either, so keep the loop alive while we wait.
 const keepAlive = setInterval(() => {}, 1_000);
-function harness({ timeoutMs, sender = "wxid_me" }) {
+function harness({ timeoutMs, sender = "wxid_me", reminderMs = 0, ledger, stopped = false }) {
   const pending = new PendingRegistry();
   const sent = [];
   const relay = new ApprovalRelay({
@@ -134,6 +138,9 @@ function harness({ timeoutMs, sender = "wxid_me" }) {
     sendText: async (_to, text) => {
       sent.push(text);
     },
+    ...(ledger === undefined ? {} : { ledger }),
+    reminderMs: () => reminderMs,
+    wasStoppedRecently: () => stopped,
   });
   return { pending, sent, relay };
 }
@@ -203,6 +210,98 @@ const request = (signal) => ({ agent: { id: "a1" }, toolName: "bash", reason: "�
   pending.popFor("wxid_me")?.resolve(null);
   equal("and can still be withdrawn by an abort", await outcome, "cancelled");
 }
+
+
+// ---------------------------------------------------------------- the ledger and the nudge (D49)
+
+const { CommandLedger } = await import(join(ROOT, "lib/ledger.js"));
+const { mkdtempSync: mkdtempA, rmSync: rmA } = await import("node:fs");
+const { tmpdir: tmpA } = await import("node:os");
+const LEDGER_DIR = mkdtempA(join(tmpA(), "clawbot-approval-ledger-"));
+const stages = (ledger) => ledger.recent(50).filter((entry) => entry.command === "审批").map((entry) => entry.args?.stage);
+
+// The card going out is recorded, so "did it arrive?" stops being a guess.
+{
+  const ledger = new CommandLedger({ dir: LEDGER_DIR });
+  const { pending, relay } = harness({ timeoutMs: 50, ledger });
+  const outcome = relay.answer(request(new AbortController().signal), async () => "allowed-once");
+  await sleep(5);
+  check("sending the card is recorded", stages(ledger).includes("sent"), JSON.stringify(stages(ledger)));
+  pending.popFor("wxid_me")?.resolve("同意");
+  await outcome;
+  check("answering it is recorded too", stages(ledger).includes("answered"), JSON.stringify(stages(ledger)));
+  const answered = ledger.recent(50).filter((entry) => entry.args?.stage === "answered").at(-1);
+  check("the record keeps the decision", answered?.args?.decision === "yes", JSON.stringify(answered?.args));
+  check("and how long it waited", typeof answered?.args?.waitedMs === "number");
+}
+
+// One nudge, and only when nobody answered in time.
+{
+  const ledger = new CommandLedger({ dir: LEDGER_DIR });
+  const { pending, sent, relay } = harness({ timeoutMs: 2_000, reminderMs: 10, ledger });
+  const outcome = relay.answer(request(new AbortController().signal), async () => "allowed-once");
+  await sleep(30);
+  check("a nudge is sent when nobody answers", sent.some((text) => text.includes("还在等")), sent.join(" | "));
+  check("the nudge names the commands", sent.some((text) => text.includes("#允许") && text.includes("#拒绝")), sent.join(" | "));
+  check("the nudge is recorded", stages(ledger).includes("reminded"), JSON.stringify(stages(ledger)));
+  check("only one nudge", sent.filter((text) => text.includes("还在等")).length === 1, sent.join(" | "));
+  pending.popFor("wxid_me")?.resolve("拒绝");
+  await outcome;
+  await sleep(30);
+  check("no second nudge after the answer", sent.filter((text) => text.includes("还在等")).length === 1, sent.join(" | "));
+}
+
+{
+  const ledger = new CommandLedger({ dir: LEDGER_DIR });
+  const { pending, sent, relay } = harness({ timeoutMs: 2_000, reminderMs: 20, ledger });
+  const outcome = relay.answer(request(new AbortController().signal), async () => "allowed-once");
+  await sleep(3);
+  pending.popFor("wxid_me")?.resolve("同意");
+  await outcome;
+  await sleep(40);
+  check("a quick answer never sees a nudge", !sent.some((text) => text.includes("还在等")), sent.join(" | "));
+}
+
+// Answered on the desktop: the phone is told, because otherwise it waits for
+// ever without knowing the question is gone.
+{
+  const ledger = new CommandLedger({ dir: LEDGER_DIR });
+  const { sent, relay } = harness({ timeoutMs: 5_000, ledger });
+  const stop = new AbortController();
+  const outcome = relay.answer(request(stop.signal), async () => "allowed-once");
+  await sleep(5);
+  stop.abort();
+  await outcome;
+  check("a desktop answer tells the phone", sent.some((text) => text.includes("在电脑上处理")), sent.join(" | "));
+  check("and is recorded as such", stages(ledger).includes("elsewhere"), JSON.stringify(stages(ledger)));
+}
+
+// Stopped with #停一下: the phone already got 已停《…》; a second line would lie.
+{
+  const ledger = new CommandLedger({ dir: LEDGER_DIR });
+  const { sent, relay } = harness({ timeoutMs: 5_000, ledger, stopped: true });
+  const stop = new AbortController();
+  const outcome = relay.answer(request(stop.signal), async () => "allowed-once");
+  await sleep(5);
+  stop.abort();
+  await outcome;
+  check("a stopped turn says nothing more", !sent.some((text) => text.includes("在电脑上处理")), sent.join(" | "));
+  check("but it is recorded as a stop", stages(ledger).includes("stopped"), JSON.stringify(stages(ledger)));
+}
+
+// The timeout keeps its own record and its own line (D44).
+{
+  const ledger = new CommandLedger({ dir: LEDGER_DIR });
+  const { sent, relay } = harness({ timeoutMs: 10, ledger });
+  const outcome = relay.answer(request(new AbortController().signal), async () => "allowed-once");
+  await sleep(30);
+  check("a timeout is recorded", stages(ledger).includes("timeout"), JSON.stringify(stages(ledger)));
+  check("the timeout line is still there", sent.some((text) => text.includes("审批超时")), sent.join(" | "));
+  check("a timeout is not reported as a desktop answer", !sent.some((text) => text.includes("在电脑上处理")), sent.join(" | "));
+  await outcome;
+}
+
+rmA(LEDGER_DIR, { recursive: true, force: true });
 
 clearInterval(keepAlive);
 

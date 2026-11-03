@@ -3211,7 +3211,7 @@ function check(name, ok, detail) {
         let { ctx, config, sendText, codexPeer, pending, backlog, calendarHelper, alarms, uploadFileTo, fs,
               pickAccount, WechatBridge, InboundRouter, runMonitor, logger, carryOverLegacyReminders,
               // >>> local: startMonitor 现在还会把 relay/modes/账本交给 InboundRouter 与 bridge
-              modes, relays, ledger, stops } = deps;
+              modes, relays, ledger, stops, recentStops, acks, ensureAckTick } = deps;
         let bridge = null, router = null, monitorTask = null, currentAccount = null, warmSession, abort = new AbortController();
         ${monitorCode}
         const restart = (hot) => {
@@ -3242,6 +3242,7 @@ function check(name, ok, detail) {
           logger: { info() {}, warn() {}, error() {} }, carryOverLegacyReminders() {},
           // 假的路由器不看这几个,传占位即可。
           modes: { lookup: () => ({ binding: null, expired: null }) }, relays: null, ledger: {}, stops: {},
+          recentStops: { note() {}, has: () => false }, acks: { size: 0, due: () => [] }, ensureAckTick() {},
         });
         hh.startMonitor();
         config.macCalendar = false;

@@ -67,3 +67,38 @@ export function isStopWord(text: string | null): boolean {
   const word = text.trim().replace(TRAILING_PUNCTUATION, "").replace(/^#/u, "").trim();
   return /^(停|停下|停一下|stop)$/iu.test(word);
 }
+
+/** How long a completed `#停一下` keeps explaining the next abort. */
+export const RECENT_STOP_MS = 10_000;
+
+/**
+ * Sessions stopped by `#停一下` a moment ago (D49).
+ *
+ * When an approval's turn is aborted, the phone deserves a line — unless the
+ * owner is the one who stopped it, in which case "已停《…》" already said it and
+ * a second message ("这条审批已经在电脑上处理了") would be a lie.
+ */
+export class RecentStops {
+  private readonly noted = new Map<string, number>();
+  private readonly windowMs: number;
+
+  constructor(windowMs: number = RECENT_STOP_MS) {
+    this.windowMs = windowMs;
+  }
+
+  /** Remember that this session was stopped just now. */
+  note(sessionId: string, now: number): void {
+    this.noted.set(sessionId, now);
+  }
+
+  /** Was it stopped within the window? Expired entries clear themselves. */
+  has(sessionId: string, now: number): boolean {
+    const at = this.noted.get(sessionId);
+    if (at === undefined) return false;
+    if (now - at > this.windowMs) {
+      this.noted.delete(sessionId);
+      return false;
+    }
+    return true;
+  }
+}

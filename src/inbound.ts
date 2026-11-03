@@ -27,7 +27,9 @@ import { cancelDshSession } from "./dsh-sessions.js";
 import type { CommandLedger, LedgerDraft } from "./ledger.js";
 import type { ModeStore } from "./modes.js";
 import type { RelayService } from "./relay.js";
-import { isStopWord, type StopConfirms } from "./stop.js";
+import { isStopWord, type RecentStops, type StopConfirms } from "./stop.js";
+import type { AckQueue } from "./ack.js";
+import { replyPrefix } from "./relay.js";
 
 function isMediaItem(item: MessageItem | undefined): boolean {
   return (
@@ -138,6 +140,9 @@ export class InboundRouter {
   private readonly relay?: RelayService;
   private readonly ledger?: CommandLedger;
   private readonly stop?: StopConfirms;
+  private readonly recentStops?: RecentStops;
+  private readonly acks?: AckQueue;
+  private readonly onArmAck?: () => void;
 
   constructor(deps: {
     config: ClawbotConfig;
@@ -155,6 +160,12 @@ export class InboundRouter {
     ledger?: CommandLedger;
     /** The "回「停」才停" window (D14). */
     stop?: StopConfirms;
+    /** Sessions stopped a moment ago (D49). */
+    recentStops?: RecentStops;
+    /** 「已收到，正在处理中…」receipts (D51). */
+    acks?: AckQueue;
+    /** Start the ticker that flushes due receipts. */
+    onArmAck?: () => void;
   }) {
     this.config = deps.config;
     this.account = deps.account;
@@ -166,6 +177,9 @@ export class InboundRouter {
     this.relay = deps.relay;
     this.ledger = deps.ledger;
     this.stop = deps.stop;
+    this.recentStops = deps.recentStops;
+    this.acks = deps.acks;
+    this.onArmAck = deps.onArmAck;
   }
 
   /** Whether a sender may talk to the agent. */
@@ -267,6 +281,9 @@ export class InboundRouter {
       this.stop?.clear(sender);
       if (isStopWord(plainText)) {
         const cancelled = cancelDshSession(this.ctx, stopTarget.sessionId);
+        if (cancelled.ok) this.recentStops?.note(stopTarget.sessionId, Date.now());
+        // Nothing is being processed any more: a receipt would be a lie (D51).
+        if (cancelled.ok) this.acks?.cancel(sender);
         this.ledger?.append(
           {
             command: "停一下",
@@ -310,6 +327,9 @@ export class InboundRouter {
         capture: (url: string) => this.captureOne(url),
         captureReady: captureReady(this.config),
         captureBaseUrl: this.config.captureBaseUrl,
+        workspaceRoots: this.config.workspaceRoots,
+        noteStop: (sessionId: string) => this.recentStops?.note(sessionId, Date.now()),
+        cancelAck: () => this.acks?.cancel(sender),
         // D29: only commands with a side effect get a line in the agent's context.
         note: (text: string) => this.bridge.noteCommand(text),
         record,
@@ -454,6 +474,11 @@ export class InboundRouter {
     if (lookup.binding !== null) {
       this.modes?.touch(sender);
       const sent = await this.relay?.relay(sender, lookup.binding, content);
+      // D51: the receipt carries the same [标题] prefix the answer will have.
+      if (sent !== undefined && sent.ok) {
+        this.acks?.arm(sender, Date.now(), replyPrefix(lookup.binding.title));
+        this.onArmAck?.();
+      }
       if (sent !== undefined && !sent.ok) {
         // 投递失败（会话没了 / 没有 sessionController）：说清楚，别让消息静默消失。
         await this.sendText(sender, `接管的目标会话投递失败：${sent.message}\n\n「#交还」回到专属 agent。`).catch(() => {});
@@ -468,6 +493,10 @@ export class InboundRouter {
 
     // firstImagePath 让 bridge 能把图片本身附上,而不只是给一个路径。
     await this.bridge.enqueueMessage(sender, content, firstImagePath);
+    // D51: nothing has been said yet; if the answer takes longer than a few
+    // seconds, say this message is being worked on.
+    this.acks?.arm(sender, Date.now());
+    this.onArmAck?.();
   }
 
   /** Read one URL and file it (the capture fast path, shared with `#入库`). */

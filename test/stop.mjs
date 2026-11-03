@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, "..");
-const { StopConfirms, isStopWord, STOP_CONFIRM_MS } = await import(join(ROOT, "lib/stop.js"));
+const { StopConfirms, RecentStops, isStopWord, STOP_CONFIRM_MS, RECENT_STOP_MS } = await import(join(ROOT, "lib/stop.js"));
 
 let pass = 0;
 const failures = [];
@@ -65,4 +65,19 @@ if (failures.length > 0) {
   for (const failure of failures) console.error(`  ✗ ${failure}`);
   process.exit(1);
 }
+// ---------------------------------------------------------------- recent stops (D49)
+
+// A stop explains the next abort: an aborted approval right after #停一下 must
+// not be reported as "answered on the desktop".
+{
+  const recent = new RecentStops();
+  check("nothing is recent before a stop", recent.has("session-alpha", now) === false);
+  recent.note("session-alpha", now);
+  check("a just-stopped session is remembered", recent.has("session-alpha", now + 100));
+  check("another session is unaffected", recent.has("session-beta", now + 100) === false);
+  check("it lasts the documented window", recent.has("session-alpha", now + RECENT_STOP_MS - 1) === true);
+  check("and expires after it", recent.has("session-alpha", now + RECENT_STOP_MS + 1) === false);
+  check("an expired note is gone for good", recent.has("session-alpha", now) === false);
+}
+
 console.log(`stop: ${pass} passed, 0 failed`);
