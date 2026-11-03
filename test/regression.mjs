@@ -3724,6 +3724,21 @@ function check(name, ok, detail) {
   }
 }
 
+// ------------------------------------------------- 发送失败的 cause 链 (src/tool.ts)
+
+{
+  // "发送失败: fetch failed" 等于没说：真正的原因在 cause 里。
+  const { errorChain } = await import(join(ROOT, "lib/tool.js"));
+  const cause = Object.assign(new Error("Connect Timeout Error (attempted address: novac2c.cdn.weixin.qq.com:443)"), { name: "ConnectTimeoutError" });
+  const outer = new TypeError("fetch failed", { cause });
+  const line = errorChain(outer);
+  check("发送失败带上 cause 链", line.includes("fetch failed") && line.includes("cdn.weixin.qq.com"), line);
+  check("没有 cause 时就是原文", errorChain(new Error("plain")) === "plain");
+  check("非 Error 也能读", errorChain("boom") === "boom");
+  const deep = new TypeError("fetch failed", { cause: new TypeError("fetch failed", { cause }) });
+  check("链不会无限展开", errorChain(deep).split("（").length === 3, errorChain(deep));
+}
+
 // ------------------------------------------------- 电脑权限 (src/permissions.ts + the card row)
 {
   const perm = await import(join(ROOT, "lib/permissions.js"));

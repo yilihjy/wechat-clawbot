@@ -360,6 +360,31 @@ v1 不写入工作台，桥自己留 90 天。
 把进程吊住；答完/撤销时清掉定时器，避免批准之后又冒出一句「审批超时」。
 `0` 仍然表示一直等（显式关掉这个行为）。
 
+### D52 发图失败：代理把微信 CDN 吞了（2026-11-03）
+
+现象：重启后 `send_wechat_file` 连试四次全失败，回执是 `发送失败: fetch failed`；11-01 同样的动作是成功的。
+
+查明：
+
+```
+直接连 https://novac2c.cdn.weixin.qq.com/c2c   → HTTP 400/404，0.3 秒
+走 127.0.0.1:15556 代理同一地址               → 连接超时
+带 HTTP(S)_PROXY + NODE_USE_ENV_PROXY 跑 node fetch → "fetch failed（Connect TimeoutError…:443）"
+```
+
+也就是说：**DSH 是从一个带代理环境变量的终端启动的**。`@deepseek-ai/dsh-http-proxy` 会按启动环境
+装一个全局 undici dispatcher，于是插件里所有 `fetch` 都走代理——而那个代理到微信 CDN 通不了
+（API 主机 `ilinkai.weixin.qq.com` 它倒是能转发，所以文字消息正常，只有图/文件挂）。当前这个实例
+（12:09 由 Finder 拉起）环境里没有代理变量，所以现在应该能发。
+
+两件事：
+
+1. **回执要看得懂**：`fetch failed` 单独一句没有行动价值。`tool.ts` 现在把 cause 链带上，
+   同样的故障会显示 `fetch failed（Connect Timeout Error (attempted address: novac2c.cdn.weixin.qq.com:443…)）`。
+2. **别从带代理的终端启动 DSH**（或者把 `novac2c.cdn.weixin.qq.com` 加进 `NO_PROXY`）。
+   代码层面还有一条可选路：上传走 `node:https` 而不是 `fetch`（`node:https` 不看代理环境），
+   但那要重写重试与超时路径，先不做。
+
 ### D49 审批：可追踪、会提醒、两边互斥（2026-11-03）
 
 起因：2026-11-02 23:54 那条 bash 审批，主人说"没收到卡片，我是在电脑上点的"。

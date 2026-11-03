@@ -361,6 +361,22 @@ export type FileUploadResult = { ok: true } | { ok: false; windowClosed: boolean
  * Compress (unless `original`), refuse what the CDN will reject, then upload
  * and send one file. send_wechat_file and the backlog's later delivery share it.
  */
+/**
+ * The error and everything that caused it, on one line.
+ *
+ * undici reports a failed request as `TypeError: fetch failed` and hides the
+ * reason in `cause`; without it the owner reads "发送失败: fetch failed" and has
+ * nothing to act on (2026-11-03: the real reason was a connect timeout through
+ * an HTTP proxy inherited from the launch environment).
+ */
+export function errorChain(err: unknown, depth = 0): string {
+  if (!(err instanceof Error)) return String(err);
+  const cause = (err as Error & { cause?: unknown }).cause;
+  const head = err.message || err.name;
+  if (cause === undefined || depth >= 3) return head;
+  return `${head}（${errorChain(cause, depth + 1)}）`;
+}
+
 export async function uploadFileTo(params: {
   config: ClawbotConfig;
   account: ResolvedWeixinAccount;
@@ -458,12 +474,16 @@ export async function uploadFileTo(params: {
       cdnBaseUrl: account.cdnBaseUrl,
     });
   } catch (err) {
-    logger.error(`send_wechat_file: failed ${resolved}: ${String(err)}`);
+    // `fetch failed` on its own says nothing: the useful part is the cause
+    // chain (a CDN 4xx, a TLS error, or — measured 2026-11-03 — a connect
+    // timeout through an HTTP proxy picked up from the launch environment).
+    const detail = errorChain(err);
+    logger.error(`send_wechat_file: failed ${resolved}: ${detail}`);
     return {
       ok: false,
       windowClosed: isSendWindowClosed(err),
       permanent: false,
-      message: `发送失败: ${err instanceof Error ? err.message : String(err)}`,
+      message: `发送失败: ${detail}`,
     };
   } finally {
     // Drop the downscaled copy; the original on disk is never touched.
