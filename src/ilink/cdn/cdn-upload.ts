@@ -1,5 +1,7 @@
 import { encryptAesEcb } from "./aes-ecb.js";
+// >>> local: 微信 CDN 改走 node:https 直连（D52）——fetch 会被系统代理吞掉
 import { cdnRequest } from "./cdn-http.js";
+// <<< local
 import { buildCdnUploadUrl } from "./cdn-url.js";
 import { logger } from "../util/logger.js";
 import { redactUrl } from "../util/redact.js";
@@ -50,14 +52,14 @@ export async function uploadBufferToCdn(params: {
 
   for (let attempt = 1; attempt <= UPLOAD_MAX_RETRIES; attempt++) {
     try {
-      // Not `fetch` on purpose: the host proxies fetch through the system proxy,
-      // which cannot reach the WeChat CDN (see cdn-http.ts).
+      // >>> local: 原上游用 fetch；宿主把 fetch 接到系统代理上，到微信 CDN 通不了（D52）
       const res = await cdnRequest(cdnUrl, {
         method: "POST",
         headers: { "Content-Type": "application/octet-stream" },
         body: Buffer.from(ciphertext),
         timeoutMs: 60_000,
       });
+      // <<< local
       if (res.status >= 400 && res.status < 500) {
         const errMsg = String(res.headers["x-error-message"] ?? res.body.toString("utf8").slice(0, 200));
         logger.error(

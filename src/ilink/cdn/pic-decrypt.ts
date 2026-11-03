@@ -1,6 +1,8 @@
 import { decryptAesEcb } from "./aes-ecb.js";
 import { buildCdnDownloadUrl, ENABLE_CDN_URL_FALLBACK } from "./cdn-url.js";
+// >>> local: 微信 CDN 改走 node:https 直连（D52）——fetch 会被系统代理吞掉
 import { cdnRequest } from "./cdn-http.js";
+// <<< local
 import { logger } from "../util/logger.js";
 
 /**
@@ -8,9 +10,8 @@ import { logger } from "../util/logger.js";
  */
 async function fetchCdnBytes(url: string, label: string): Promise<Buffer> {
   let res;
+  // >>> local: 原上游用 fetch；宿主把 fetch 接到系统代理上，到微信 CDN 通不了（D52）
   try {
-    // Direct transport, not fetch: the host's fetch is proxied and that proxy
-    // cannot reach the WeChat CDN (see cdn-http.ts).
     res = await cdnRequest(url, { timeoutMs: 60_000, maxBytes: 100 * 1024 * 1024 });
   } catch (err) {
     const cause = (err as NodeJS.ErrnoException).cause ?? (err as NodeJS.ErrnoException).code ?? "(no cause)";
@@ -24,6 +25,7 @@ async function fetchCdnBytes(url: string, label: string): Promise<Buffer> {
     logger.error(msg);
     throw new Error(msg);
   }
+  // <<< local
   return res.body;
 }
 
