@@ -154,6 +154,7 @@ export class InboundRouter {
   private readonly recentStops?: RecentStops;
   private readonly acks?: AckQueue;
   private readonly onArmAck?: () => void;
+  private readonly approvalSelfCheck?: () => Promise<string>;
 
   constructor(deps: {
     config: ClawbotConfig;
@@ -177,6 +178,8 @@ export class InboundRouter {
     acks?: AckQueue;
     /** Start the ticker that flushes due receipts. */
     onArmAck?: () => void;
+    /** `#审批自检` (D53). */
+    approvalSelfCheck?: () => Promise<string>;
   }) {
     this.config = deps.config;
     this.account = deps.account;
@@ -191,6 +194,7 @@ export class InboundRouter {
     this.recentStops = deps.recentStops;
     this.acks = deps.acks;
     this.onArmAck = deps.onArmAck;
+    this.approvalSelfCheck = deps.approvalSelfCheck;
   }
 
   /** Whether a sender may talk to the agent. */
@@ -341,6 +345,7 @@ export class InboundRouter {
         workspaceRoots: this.config.workspaceRoots,
         noteStop: (sessionId: string) => this.recentStops?.note(sessionId, Date.now()),
         cancelAck: () => this.acks?.cancel(sender),
+        ...(this.approvalSelfCheck === undefined ? {} : { approvalSelfCheck: this.approvalSelfCheck }),
         // D29: only commands with a side effect get a line in the agent's context.
         note: (text: string) => this.bridge.noteCommand(text),
         record,

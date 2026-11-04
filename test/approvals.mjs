@@ -128,12 +128,22 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 // The relay unrefs its timeout timer so it can never hold DSH open. In this
 // harness nothing else does either, so keep the loop alive while we wait.
 const keepAlive = setInterval(() => {}, 1_000);
-function harness({ timeoutMs, sender = "wxid_me", reminderMs = 0, ledger, stopped = false }) {
+function harness({
+  timeoutMs,
+  sender = "wxid_me",
+  reminderMs = 0,
+  ledger,
+  stopped = false,
+  // D53: routing is decided from the configured session id, not from the bridge
+  // object, so a test can take the bridge away and still ask what happens.
+  bridge = true,
+  owner = undefined,
+} = {}) {
   const pending = new PendingRegistry();
   const sent = [];
   const relay = new ApprovalRelay({
-    config: { approvalTimeoutMs: timeoutMs },
-    getBridge: () => ({ isWechatSession: () => true, activeSender: sender }),
+    config: { approvalTimeoutMs: timeoutMs, sessionId: "a1" },
+    getBridge: () => (bridge ? { isWechatSession: (id) => id === "a1", activeSender: sender } : null),
     pending,
     sendText: async (_to, text) => {
       sent.push(text);
@@ -141,6 +151,7 @@ function harness({ timeoutMs, sender = "wxid_me", reminderMs = 0, ledger, stoppe
     ...(ledger === undefined ? {} : { ledger }),
     reminderMs: () => reminderMs,
     wasStoppedRecently: () => stopped,
+    ...(owner === undefined ? {} : { getOwnerId: () => owner }),
   });
   return { pending, sent, relay };
 }
@@ -302,6 +313,71 @@ const stages = (ledger) => ledger.recent(50).filter((entry) => entry.command ===
 }
 
 rmA(LEDGER_DIR, { recursive: true, force: true });
+
+
+// ---------------------------------------------------------------- D53: no branch is silent
+
+const stagesOf = (ledger) => ledger.recent(80).filter((entry) => entry.command === "审批").map((entry) => entry.args?.stage);
+
+// The bridge is a mount. Between mounts an approval from the WeChat session must
+// still reach the phone (this is the 2026-11-04 incident: 76 minutes on a desktop).
+{
+  const ledger = new CommandLedger({ dir: LEDGER_DIR });
+  const { pending, sent, relay } = harness({ timeoutMs: 2_000, ledger, bridge: false, owner: "wxid_owner" });
+  const outcome = relay.answer(request(new AbortController().signal), async () => "allowed-once").catch(() => "cancelled");
+  await sleep(5);
+  check("a card still goes out with no bridge mounted", sent.some((text) => text.includes("DSH 权限请求")), sent.join(" | "));
+  check("it goes to the bound owner", sent.length > 0 && sent[0] !== undefined, sent.join(" | "));
+  const sentRecord = ledger.recent(80).filter((entry) => entry.args?.stage === "sent").at(-1);
+  check("the ledger says the bridge was not mounted", sentRecord?.args?.bridgeMounted === false, JSON.stringify(sentRecord?.args));
+  check("and it names the agent that asked", typeof sentRecord?.args?.agent === "string", JSON.stringify(sentRecord?.args));
+  pending.popFor("wxid_owner")?.resolve("拒绝");
+  await outcome;
+  check("answering still works without a bridge", stagesOf(ledger).includes("answered"), JSON.stringify(stagesOf(ledger)));
+}
+
+// No bridge AND no bound account: there is nobody to ask. Fail closed, but say why.
+{
+  const ledger = new CommandLedger({ dir: LEDGER_DIR });
+  const { sent, relay } = harness({ timeoutMs: 2_000, ledger, bridge: false });
+  const outcome = await relay.answer(request(new AbortController().signal), async () => "allowed-once");
+  equal("no recipient fails closed", outcome, "unavailable");
+  check("and nothing is sent", sent.length === 0, sent.join(" | "));
+  check("the no-sender branch is recorded", stagesOf(ledger).includes("no-sender"), JSON.stringify(stagesOf(ledger)));
+}
+
+// Somebody else's conversation: the desktop keeps it, but the reason is written down.
+{
+  const ledger = new CommandLedger({ dir: LEDGER_DIR });
+  const { sent, relay } = harness({ timeoutMs: 2_000, ledger });
+  const other = { agent: { id: "session-other" }, toolName: "bash", reason: "别人的会话", signal: new AbortController().signal };
+  const outcome = await relay.answer(other, async () => "allowed-once");
+  equal("a foreign conversation is left to the desktop", outcome, "allowed-once");
+  check("nothing is sent for it", sent.length === 0, sent.join(" | "));
+  const record = ledger.recent(80).filter((entry) => entry.args?.stage === "not-ours").at(-1);
+  check("the not-ours branch is recorded with the agent", record?.args?.agent === "session-other".slice(-8), JSON.stringify(record?.args));
+  check("and says why", String(record?.summary).includes("留给桌面"), String(record?.summary));
+}
+
+// #审批自检: answers the three questions and sends a real card.
+{
+  const ledger = new CommandLedger({ dir: LEDGER_DIR });
+  const { sent, relay } = harness({ timeoutMs: 2_000, ledger, owner: "wxid_owner", sender: "wxid_owner" });
+  const report = await relay.selfCheck();
+  check("the self-check reports the mount state", report.includes("监听："), report);
+  check("it names the recipient", report.includes("wxid_owner"), report);
+  check("it states the routing verdict", report.includes("审批会发到手机"), report);
+  check("it actually sent a test card", sent.some((text) => text.includes("审批自检")), sent.join(" | "));
+  check("and recorded it", stagesOf(ledger).includes("self-check"), JSON.stringify(stagesOf(ledger)));
+}
+
+// With nobody bound the self-check says so instead of pretending.
+{
+  const { sent, relay } = harness({ timeoutMs: 2_000, bridge: false });
+  const report = await relay.selfCheck();
+  check("a self-check without a recipient is red", report.includes("审批会留在桌面") || report.includes("没有（既没有"), report);
+  check("and sends nothing", sent.length === 0, sent.join(" | "));
+}
 
 clearInterval(keepAlive);
 

@@ -97,6 +97,7 @@ export class ApprovalRelay {
   private readonly ledger: CommandLedger | undefined;
   private readonly wasStoppedRecently: ((sessionId: string) => boolean) | undefined;
   private readonly reminderMs: () => number;
+  private readonly getOwnerId: (() => string | undefined) | undefined;
 
   constructor(deps: {
     config: ClawbotConfig;
@@ -112,6 +113,14 @@ export class ApprovalRelay {
     wasStoppedRecently?: (sessionId: string) => boolean;
     /** Live read of the reminder delay, so a settings change needs no restart. */
     reminderMs?: () => number;
+    /**
+     * The bound owner's WeChat id (`account.userId`).
+     *
+     * The fallback recipient when no turn is active: an approval that belongs to
+     * the phone must reach the phone even if we cannot tell who is typing right
+     * now — the owner is the only human this deployment talks to.
+     */
+    getOwnerId?: () => string | undefined;
   }) {
     this.config = deps.config;
     this.getBridge = deps.getBridge;
@@ -121,6 +130,7 @@ export class ApprovalRelay {
     this.ledger = deps.ledger;
     this.wasStoppedRecently = deps.wasStoppedRecently;
     this.reminderMs = deps.reminderMs ?? (() => 0);
+    this.getOwnerId = deps.getOwnerId;
   }
 
   /** Register the `approval/request` waterfall listener on the root context. */
@@ -134,19 +144,52 @@ export class ApprovalRelay {
     req: ApprovalRequest,
     next: () => Promise<ApprovalOutcome>,
   ): Promise<ApprovalOutcome> {
+    // Routing must not depend on the bridge object (D53). `#审批自检` and the
+    // 2026-11-04 incident both come down to the same thing: the bridge is a
+    // *mount*, and between mounts `getBridge()` is null while a tool call is
+    // still running and still needs an answer. Judging "is this the WeChat
+    // session" from the configured id, and falling back to the bound owner as
+    // the recipient, is what keeps those approvals on the phone.
     const bridge = this.getBridge();
-    if (!bridge) return next();
-    const isWechat = bridge.isWechatSession(req.agent.id);
+    const agentId = String(req.agent.id);
+    const isWechat = agentId === this.config.sessionId;
+    const owner = this.getOwnerId?.();
+    const activeSender = bridge?.activeSender ?? owner;
     // >>> local: relay 的审批也走微信（D16）
     const route = approvalRoute({
       isWechat,
-      ...(bridge.activeSender === undefined ? {} : { activeSender: bridge.activeSender }),
-      relay: isWechat ? null : this.modes?.peerFor(req.agent.id) ?? null,
+      ...(activeSender === undefined ? {} : { activeSender }),
+      relay: isWechat ? null : this.modes?.peerFor(agentId) ?? null,
       now: Date.now(),
     });
-    if (route.kind === "not-ours") return next();
+    const diag = {
+      agent: agentId.slice(-8),
+      bridgeMounted: bridge !== null,
+      owner: owner === undefined ? null : "bound",
+    };
+    if (route.kind === "not-ours") {
+      // Not ours is a real answer, not a reason to stay quiet: the owner sees a
+      // card on the desktop and needs to know why it never reached the phone.
+      const relay = this.modes?.peerFor(agentId) ?? null;
+      this.record("noop", `没接：审批来自 ${diag.agent}，${relay === null ? "不是微信会话，也没在接管中" : "接管的窗口已过期"} → 留给桌面`, {
+        ...diag,
+        stage: "not-ours",
+        tool: req.toolName,
+        relayBinding: relay !== null,
+      });
+      logger.info(`approval: not ours (agent=${agentId}); left to the desktop UI`);
+      return next();
+    }
     if (route.kind === "no-sender") {
-      logger.warn(`approval: no active WeChat sender for agent ${req.agent.id}; failing closed`);
+      // No active sender AND no bound account: there is nobody to ask. Failing
+      // closed is deliberate (a phone-owned agent must not pop a desktop
+      // dialog), but it is now written down with the reason.
+      this.record("failed", `没接：${diag.agent} 的审批找不到收件人（没有 activeSender，也没有绑定账号）`, {
+        ...diag,
+        stage: "no-sender",
+        tool: req.toolName,
+      });
+      logger.warn(`approval: no recipient for agent ${agentId}; failing closed`);
       return "unavailable";
     }
     const sender = route.sender;
@@ -169,12 +212,22 @@ export class ApprovalRelay {
       if (route.kind === "relay") this.modes?.touch(sender);
     } catch (err) {
       logger.error(`approval: failed to send question to ${sender}: ${String(err)}`);
-      this.record("failed", `没能把审批发到微信：${String(err).slice(0, 80)}`, { tool: req.toolName, route: routeKind, stage: "send" });
+      this.record("failed", `没能把审批发到微信：${String(err).slice(0, 80)}`, {
+        ...diag,
+        tool: req.toolName,
+        route: routeKind,
+        stage: "send",
+      });
       return "unavailable";
     }
     // D49: the card is one text message in a chat stream; record that it went
     // out, so "did I get a card?" stops being a question nobody can answer.
-    this.record("ok", `发出审批（${who}）：${req.toolName}`, { tool: req.toolName, route: routeKind, stage: "sent" });
+    this.record("ok", `发出审批（${who}）：${req.toolName}${diag.bridgeMounted ? "" : "（监听未挂载，按会话兜底发出）"}`, {
+      ...diag,
+      tool: req.toolName,
+      route: routeKind,
+      stage: "sent",
+    });
     // The send can take seconds. If the turn was stopped meanwhile, the abort
     // already fired and a listener added now would never run — the entry would
     // then sit in the queue and swallow the owner's next message.
@@ -281,6 +334,57 @@ export class ApprovalRelay {
         timer.unref?.();
       }
     });
+  }
+
+  /**
+   * `#审批自检` — prove this chain end to end, on the spot (D53).
+   *
+   * Answers the three questions a silent miss raises: is the listener mounted,
+   * who would receive the card, and can the card actually leave. It sends a real
+   * message to the same recipient the next approval would use, so a green result
+   * means the phone saw a card — not that a code path "should" work.
+   */
+  async selfCheck(): Promise<string> {
+    const started = Date.now();
+    const bridge = this.getBridge();
+    const owner = this.getOwnerId?.();
+    const activeSender = bridge?.activeSender ?? owner;
+    const route = approvalRoute({
+      isWechat: true,
+      ...(activeSender === undefined ? {} : { activeSender }),
+      relay: null,
+      now: Date.now(),
+    });
+    const recipient = route.kind === "wechat" || route.kind === "relay"
+      ? route.sender
+      : "没有（既没有 activeSender，也没有绑定账号）";
+    const lines = [
+      "【审批自检】",
+      `监听：${bridge === null ? "未挂载（现在这条链路靠会话 id + 绑定账号兜底）" : "已挂载"}`,
+      `微信会话：${this.config.sessionId.slice(-8)}`,
+      `收件人：${recipient}`,
+      `路由结论：${route.kind === "wechat" ? "审批会发到手机" : "审批会留在桌面"}`,
+      `超时：${this.config.approvalTimeoutMs === 0 ? "一直等" : `${Math.round(this.config.approvalTimeoutMs / 60000)} 分钟`}`,
+    ];
+    if (route.kind !== "wechat") {
+      this.record("failed", "审批自检：这条链路到不了手机", { stage: "self-check", route: route.kind });
+      lines.push("", "结论：不通。上面两行就是原因（先看账号绑没绑）。");
+      return lines.join("\n");
+    }
+    try {
+      await this.sendText(
+        route.sender,
+        "【DSH 审批自检】\n这条只是测试，不会执行任何操作。\n看到它就说明：审批卡片能发到这个手机。\n真实审批会带「工具 / 原因 / #允许 / #拒绝」三行。",
+      );
+      this.record("ok", "审批自检：测试卡片已发到手机", { stage: "self-check", route: "wechat", bridgeMounted: bridge !== null });
+      lines.push("", "刚发了一张测试卡片 —— 手机上看到它就说明链路通。", "账本：已记录（这次自检可查）");
+    } catch (err) {
+      const detail = String((err as Error)?.message ?? err).slice(0, 120);
+      this.record("failed", `审批自检：卡片发不出去（${detail}）`, { stage: "self-check", route: "wechat" });
+      lines.push("", `结论：卡片发不出去 —— ${detail}`);
+    }
+    lines.push(`（耗时 ${Date.now() - started} ms）`);
+    return lines.join("\n");
   }
 
   /**

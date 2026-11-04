@@ -542,6 +542,9 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
       recentStops,
       acks,
       onArmAck: ensureAckTick,
+      // D53: `#审批自检` asks the approval relay the same questions a real
+      // request would, and sends a real card through the same sender.
+      approvalSelfCheck: () => relay.selfCheck(),
       ...(relays === null ? {} : { relay: relays }),
     });
 
@@ -656,6 +659,9 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
     ledger,
     wasStoppedRecently: (sessionId: string) => recentStops.has(sessionId, Date.now()),
     reminderMs: () => config.approvalReminderMs,
+    // D53: the bound owner is the fallback recipient when no turn is active —
+    // an approval that belongs to the phone must reach the phone anyway.
+    getOwnerId: () => currentAccount?.userId,
   });
   relay.register(ctx);
 

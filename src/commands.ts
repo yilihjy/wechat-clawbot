@@ -62,6 +62,7 @@ const HELP: ReadonlyArray<readonly [name: string, summary: string]> = [
   ["#停一下", "打断当前回合（接管中会先问一句）"],
   ["#允许", "批准挂着的权限请求"],
   ["#拒绝", "拒绝挂着的权限请求"],
+  ["#审批自检", "当场验证审批卡片能不能到手机"],
   ["#模型", "列出可用模型"],
   ["#模型 N", "把当前会话切到第 N 个模型"],
   ["#当前模式", "我现在的模式、会话与工作区"],
@@ -164,6 +165,8 @@ export interface CommandDeps {
   readonly approve?: (decision: "yes" | "no") => "answered" | "question" | "none";
   /** Note that this session was just stopped, so an abort is explained (D49). */
   readonly noteStop?: (sessionId: string) => void;
+  /** `#审批自检` (D53): prove the approval chain end to end. */
+  readonly approvalSelfCheck?: () => Promise<string>;
   /** Drop the pending 「已收到」receipt for this peer (D51). */
   readonly cancelAck?: () => void;
   /** Drop a mirror the relay still owes for a conversation that lost its binding. */
@@ -236,6 +239,12 @@ export async function runCommand(routed: Routed, deps: CommandDeps): Promise<str
       return newSession(deps, routed.arg);
     case "工作区":
       return workspacesText(deps);
+    case "审批自检": {
+      if (deps.approvalSelfCheck === undefined) return "审批链路没接上（插件没有装配审批中继）。";
+      const report = await deps.approvalSelfCheck();
+      record(deps, { command: "审批自检", result: "ok", summary: "跑了一次审批自检" });
+      return report;
+    }
     case "模型":
       return modelCommand(deps, routed.arg);
     case "允许":

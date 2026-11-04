@@ -988,7 +988,8 @@ function check(name, ok, detail) {
       pending.popFor("u1") === approval && !pending.hasFor("u1"));
   }
   const relayWith = (pending, sendText) => new ApprovalRelay({
-    config: { approvalTimeoutMs: 0 },
+    // D53: routing is decided from the configured session id, not the bridge.
+    config: { approvalTimeoutMs: 0, sessionId: "a1" },
     getBridge: () => ({ isWechatSession: () => true, activeSender: "u1" }),
     pending,
     sendText,

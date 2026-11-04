@@ -208,6 +208,18 @@ notes.length = 0;
 const unready = await run("#入库 https://example.com/x", { capture: async () => filed, captureReady: false });
 check("#入库 without a token explains the config", unready.includes("capture"), unready);
 check("#入库 without a token notes nothing", notes.length === 0);
+// #审批自检 (D53): the command must exist, and when the relay is not wired it
+// must say so instead of pretending.
+{
+  check("help lists #审批自检", helpText().includes("#审批自检"));
+  const routed = routeInboundCommand("#审批自检");
+  check("#审批自检 routes to the command layer", routed.kind === "command" && routed.name === "审批自检", JSON.stringify(routed));
+  const report = await run("#审批自检", { approvalSelfCheck: async () => "【审批自检】\n监听：已挂载" });
+  check("#审批自检 returns the relay's report", report.includes("监听：已挂载"), report);
+  const bare = await run("#审批自检");
+  check("#审批自检 without a relay says so", bare.includes("没接上"), bare);
+}
+
 // ---------------------------------------------------------------- the newer commands (D12/D14/D30, Q1/Q3)
 
 const { StopConfirms } = await import(join(ROOT, "lib/stop.js"));
