@@ -1,6 +1,6 @@
 # wechat-clawbot 安装与排错手册
 
-> **适用版本**：wechat-clawbot **1.3.1**；DeepSeek Harness（DSH）**0.1.7 到 0.2.1**（在 0.1.7-rc.2、0.2.0-rc.2、0.2.1-rc.2 和 0.2.1-rc.3 上测过）。
+> **适用版本**：wechat-clawbot **1.3.2**；DeepSeek Harness（DSH）**0.1.7 到 0.2.2**（在 0.1.7-rc.2、0.2.0-rc.2、0.2.1-rc.2、0.2.1-rc.5 和 0.2.2-rc.1 上测过）。
 >
 > **写给谁**：一个能执行命令、正在替别人安装 wechat-clawbot 的 AI agent。人看也一样适用。
 > README 讲「它是什么、怎么用」，这份讲「怎么装好、怎么验收、出了问题怎么查」。
@@ -26,7 +26,7 @@
 
 | 检查项 | 怎么查 | 不满足会怎样 |
 |---|---|---|
-| DSH 版本 | `dsh --version` | 需要 **0.1.7 到 0.2.1**。插件声明的范围是 `^0.1.7-rc.1 \|\| ^0.2.0-rc.1`，不在范围内会被整个跳过（见上一节）。0.1.5 及更早：浏览器端整页白屏。**0.2.1**（含 alpha）：要 wechat-clawbot 1.3.0 或更新，见[已知问题](#已知问题) |
+| DSH 版本 | `dsh --version` | 需要 **0.1.7 到 0.2.2**。插件声明的范围是 `^0.1.7-rc.1 \|\| ^0.2.0-rc.1`，不在范围内会被整个跳过（见上一节）。0.1.5 及更早：浏览器端整页白屏。**0.2.1**（含 alpha）：要 wechat-clawbot 1.3.0 或更新；**0.2.2**（含 alpha/rc）：要 wechat-clawbot 1.3.2 或更新，见[已知问题](#已知问题) |
 | Node.js | `node --version` | 需要 22 或更高 |
 | pnpm | `pnpm --version` | `dsh plugin add` 用 pnpm 安装 |
 | 手机微信 | 微信 → 设置 → 插件 | 要能看到官方的「**微信ClawBot**」插件；第一次扫码时可能会提示升级微信 |
@@ -43,7 +43,7 @@
 dsh plugin --profile web add wechat-clawbot
 ```
 
-也可以在 DSH 网页侧边栏的「插件」→「添加插件」里搜 `wechat-clawbot`（插件页会自动测速，选择更快的 npm 镜像）。要固定版本就写 `wechat-clawbot@1.3.1`。
+也可以在 DSH 网页侧边栏的「插件」→「添加插件」里搜 `wechat-clawbot`（插件页会自动测速，选择更快的 npm 镜像）。要固定版本就写 `wechat-clawbot@1.3.2`。
 
 装完**重启一次 DSH**：插件的服务端代码只在启动时加载。
 
@@ -359,6 +359,7 @@ legacy reminder schedule-7 carried over as schedule-3f2a9c1e-… (due 2026-10-01
 ### 已知问题
 
 - **DSH 0.2.1（各个 alpha 和 rc）**：设定时提醒的工具（`schedule_create` 等）挪到了新包 `@deepseek-ai/dsh-tool-schedule`，由 DSH 的 standard / cordis / ptc 预设挂在 agent 自己的作用域里（0.2.1-alpha.2 和 rc.2 都是这样）。bot 用的是全局默认预设：是这三个之一就有提醒工具，改成「极简」就没有。0.2.1 的标准预设还带了「时间感知」（`dsh-time-context`）：微信消息没有浏览器时区，它会让 bot 反问你说的是哪个时区。wechat-clawbot 1.3.0 起在微信会话里把它拿掉，所以 DSH 0.2.1 要配 1.3.0 或更新（1.3.0 在 0.2.1-rc.2 上实际运行，回归测试在 0.1.7-rc.2、0.2.0-rc.2、0.2.1-rc.2 上都过）。
+- **DSH 0.2.2（alpha.3 起）换了定时任务的 API**：`schedule_create` 只收 `title`/`prompt`/`rrule`/`target`（不再有 `at`、`after_seconds` 这些），`schedule_update`/`schedule_delete` 被一个 `schedule_edit` 取代，任务表变成宿主级（所有会话都能看到），迁移旧提醒的服务签名也变了。1.3.2 起会自动识别宿主版本、两套写法都支持：0.2.1 及更早用旧的，0.2.2 起用 RRULE + `target:"this_session"`。**1.3.1 及更早配 0.2.2 不会报版本不兼容，但新建/修改/取消提醒都会失败**，日志里还会出现 `legacy reminders: carry-over failed`。到点投递不受影响（注入消息的 `source.kind` 没变），所以已经存在的提醒还会响。
 
 ---
 
@@ -384,6 +385,7 @@ legacy reminder schedule-7 carried over as schedule-3f2a9c1e-… (due 2026-10-01
 | 定时提醒迟到 | 电脑睡眠了。提醒的计时器在 DSH 进程里，进程被冻结就不会响，唤醒后才补发 |
 | 提醒或通知到点没收到，日志 `sendMessage ret=-2 errmsg=prepare failed` | 用户有一段时间（约 24 小时）没给 bot 发消息，微信不让 bot 主动发。消息已经存着，用户下次发消息、bot 回复之后会合并补发，见第 6 节 |
 | 在 DSH 0.2.1 上 bot 设不了提醒 | 0.2.1 起提醒工具由 standard / cordis / ptc 预设提供，「极简」预设没有：看全局默认预设是不是被改成了极简，见[已知问题](#已知问题) |
+| 在 DSH 0.2.2 上 bot 设不了提醒、改不了也取消不了，日志 `legacy reminders: carry-over failed` | 插件早于 1.3.2：0.2.2 把定时任务改成 RRULE + `schedule_edit`，升到 1.3.2 或更新即可；已存在的提醒到点仍会响 |
 | 在 DSH 0.2.1 上 bot 反问「你说的是哪个时区」 | 插件早于 1.3.0：升到 1.3.0 或更新，它会把 DSH 0.2.1 的时间读数挡在微信会话外 |
 | Codex 工具报「Cannot connect to the shared Codex App Server」 | `socket` 模式找不到共享服务（桌面版的服务是私有的）。见第 6 节的 Codex 部分 |
 | 让 bot 给 Claude Code 会话捎话失败，报模型不受支持 | `claude` 命令行太旧，运行 `claude update` |
