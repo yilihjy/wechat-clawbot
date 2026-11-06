@@ -238,6 +238,14 @@ export interface ClawbotConfig {
   captureToken: string;
 
   /**
+   * Let the workbench re-read a page in the host browser when the HTTP page
+   * cannot pass personal-library admission (D4=A). On by default; the
+   * environment variable `WORKBENCH_BROWSER_CAPTURE=0` (also false/off/no)
+   * switches it off globally.
+   */
+  browserCapture: boolean;
+
+  /**
    * Say 「已收到，正在处理中」 when a message has been handed to the agent and
    * nothing has come back yet (D51). 0 disables it.
    *
@@ -294,6 +302,19 @@ export interface ClawbotConfig {
   claudeResumePermissionMode: ClaudeResumeMode;
 }
 
+/**
+ * Whether `WORKBENCH_BROWSER_CAPTURE` leaves the host-browser fallback on.
+ *
+ * Unset (or empty) means on. `0`, `false`, `off` and `no` switch it off; the
+ * capture layer checks this on every attempt, so it is a kill switch that does
+ * not need a restart.
+ */
+export function browserCaptureFromEnv(value: string | undefined): boolean {
+  if (value === undefined) return true;
+  const normalized = value.trim().toLowerCase();
+  return normalized === "" || !["0", "false", "off", "no"].includes(normalized);
+}
+
 export const DEFAULT_CONFIG: ClawbotConfig = {
   autoStart: true,
   allowFrom: [],
@@ -330,6 +351,7 @@ export const DEFAULT_CONFIG: ClawbotConfig = {
   captureEnabled: false,
   captureBaseUrl: "http://127.0.0.1:4310",
   captureToken: "",
+  browserCapture: browserCaptureFromEnv(process.env.WORKBENCH_BROWSER_CAPTURE),
   ackAfterMs: 4_000,
   approvalReminderMs: 3 * 60_000,
   workspaceRoots: ["~/workspace"],
@@ -447,6 +469,8 @@ export function normalizeConfig(raw?: Partial<ClawbotConfig> | Record<string, un
       typeof r.captureToken === "string" && r.captureToken.trim()
         ? r.captureToken.trim()
         : DEFAULT_CONFIG.captureToken,
+    browserCapture:
+      typeof r.browserCapture === "boolean" ? r.browserCapture : DEFAULT_CONFIG.browserCapture,
     provider: typeof r.provider === "string" && r.provider.trim() ? r.provider.trim() : undefined,
     model: typeof r.model === "string" && r.model.trim() ? r.model.trim() : undefined,
     reasoningEffort:
@@ -500,6 +524,12 @@ export const BaseConfig = Schema.object({
     .description(
       "工作台的插件 token(Bearer,scope 要含 capture):在网页端「信源 → 浏览器插件」生成配对码,"
       + "换到 token 后填在这里。它是明文保存在 profile 里的",
+    ),
+  browserCapture: Schema.boolean()
+    .default(true)
+    .description(
+      "HTTP 抓不到正文、或正文不足个人库接纳门槛时,让工作台用宿主浏览器补抓(默认开)。"
+      + "环境变量 WORKBENCH_BROWSER_CAPTURE=0/false/off/no 可全局关掉",
     ),
   stripEmoji: Schema.boolean()
     .default(true)
@@ -665,10 +695,11 @@ export const HOT_FIELDS = new Set<keyof ClawbotConfig>([
   "reasoningEffort",
   "allowFrom",
   "attachImages",
-  // 采集三个字段都是逐条消息读取的,改完下一条消息就生效（不必重启监听）。
+  // 采集相关字段都是逐条消息读取的,改完下一条消息就生效（不必重启监听）。
   "captureEnabled",
   "captureBaseUrl",
   "captureToken",
+  "browserCapture",
   // 纯读取的开关,下一条消息生效即可,不需要重启。
   "autoMemory",
   "idleCompaction",

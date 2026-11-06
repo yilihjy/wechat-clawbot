@@ -20,6 +20,7 @@
  * or a running workbench (`test/capture.mjs`).
  */
 import type { LedgerDraft } from "./ledger.js";
+import { browserCaptureFromEnv } from "./config.js";
 import { logger } from "./ilink/util/logger.js";
 
 /** How the page is read. A phone-shaped WeChat UA is what makes the article server answer with the article. */
@@ -38,6 +39,16 @@ const MAX_PAGE_BYTES = 10_000_000;
 
 /** D25: under this many characters a capture is stored anyway, but the receipt says so. */
 export const SHORT_TEXT_CHARS = 200;
+
+/**
+ * D6 personal-library admission: the workbench auto-accepts a page only when its
+ * visible text reaches this many characters. Below it the capture stays pending
+ * for a human — and the HTTP page is worth re-reading in the host browser.
+ */
+export const PERSONAL_MIN_CHARS = 800;
+
+/** The browser fallback opens a real browser page; it is much slower than a fetch. */
+const BROWSER_TIMEOUT_MS = 60_000;
 
 /** Punctuation a phone keyboard or a chat bubble leaves at the end of a pasted URL. */
 const URL_TRAILING = /[.,;:!?。，、；：！？）】》」』]+$/u;
@@ -89,6 +100,12 @@ export interface CaptureConfig {
   readonly enabled: boolean;
   readonly baseUrl: string;
   readonly token: string;
+  /**
+   * Let the workbench re-read a page with the host browser when the HTTP page
+   * cannot pass personal-library admission. Omitted means on; the environment
+   * variable `WORKBENCH_BROWSER_CAPTURE=0` is a global kill switch.
+   */
+  readonly browserCapture?: boolean;
 }
 
 // ------------------------------------------------------------------ extraction
@@ -191,9 +208,44 @@ export interface Extracted {
   readonly title: string | null;
   readonly publisher: string | null;
   readonly publishedAt: number | null;
+  /** 公众号 biz (the account's stable id), when this page names one. */
+  readonly biz: string | null;
   readonly text: string;
   /** The page with scripts and styles removed, or "" when it would not fit. */
   readonly html: string;
+}
+
+/** Decode the URL-encoding a biz can carry (`%3D` etc.) and trim it. */
+function decodeBiz(raw: string | null | undefined): string | null {
+  if (raw === null || raw === undefined) return null;
+  let value = raw.trim();
+  if (value === "") return null;
+  try {
+    value = decodeURIComponent(value);
+  } catch {
+    // A malformed escape is still more useful than dropping the account id.
+  }
+  value = value.trim();
+  return value === "" ? null : value;
+}
+
+/** `__biz=` in an og:url or the URL we were given, decoded once. */
+function bizFromUrl(url: string | null): string | null {
+  if (url === null) return null;
+  const raw = /[?&]__biz=([^&#\s]+)/u.exec(url)?.[1];
+  return decodeBiz(raw ?? null);
+}
+
+/**
+ * The 公众号 biz: the page's own `var biz = "…"` wins, because it is the
+ * canonical value; `og:url` and finally the source URL are fallbacks. A short
+ * `https://mp.weixin.qq.com/s/<sn>` link carries no biz at all.
+ */
+function bizOf(html: string, ogUrl: string | null, sourceUrl: string): string | null {
+  const declared = /var\s+biz\s*=\s*(?:htmlDecode\(\s*)?["']([^"']*)["']/u.exec(html)?.[1];
+  const fromHtml = decodeBiz(declared ?? null);
+  if (fromHtml !== null) return fromHtml;
+  return bizFromUrl(ogUrl) ?? bizFromUrl(sourceUrl);
 }
 
 /** `var nickname = "…"` / `var nickname = htmlDecode("…")`. */
@@ -225,6 +277,7 @@ export function extractArticle(html: string, sourceUrl: string): Extracted {
     title: (ogTitle ?? (titleTag === undefined ? null : htmlToText(titleTag)))?.trim() || null,
     publisher: publisherOf(html),
     publishedAt: publishedAtOf(html),
+    biz: bizOf(html, ogUrl, sourceUrl),
     text,
     html: trimHtml(html),
   };
@@ -242,6 +295,20 @@ export interface FetchedPage {
 /** Why a capture did not land, in the words the receipt uses. */
 export type CaptureFailureKind = "config" | "fetch" | "network" | "http" | "server";
 
+/** What the workbench decided for a capture (personal library, migration 45). */
+export type CaptureOutcome = "accepted" | "pending" | "needs_manual" | "duplicate";
+
+/** The D6 admission verdict, when the workbench returned one. */
+export interface CaptureAdmission {
+  readonly admit?: boolean;
+  readonly chars?: number;
+  readonly reason?: string | null;
+  readonly detail?: string | null;
+}
+
+/** Which source produced the capture that landed. */
+export type CaptureVia = "http" | "browser";
+
 /** The result of trying to file one URL. */
 export type CaptureResult =
   | {
@@ -253,8 +320,27 @@ export type CaptureResult =
       readonly short: boolean;
       readonly status: string;
       readonly url: string;
+      /** `http` for the plain fetch, `browser` when the workbench re-read the page. */
+      readonly via: CaptureVia;
+      /** True when both the HTTP attempt and the browser fallback failed to file it. */
+      readonly degraded: boolean;
+      readonly outcome?: CaptureOutcome;
+      readonly admission?: CaptureAdmission;
+      readonly libraryScope?: "personal" | "site";
+      readonly sourceArticleId?: string | null;
+      /** Why the browser fallback failed, kept for the receipt. */
+      readonly browserError?: string;
     }
-  | { readonly ok: false; readonly kind: CaptureFailureKind; readonly message: string; readonly url: string };
+  | {
+      readonly ok: false;
+      readonly kind: CaptureFailureKind;
+      readonly message: string;
+      readonly url: string;
+      readonly via: CaptureVia;
+      readonly degraded: boolean;
+      /** Why the browser fallback failed, kept for the receipt. */
+      readonly browserError?: string;
+    };
 
 type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
@@ -295,19 +381,41 @@ export function isVerificationShell(page: FetchedPage): boolean {
   return /环境异常|完成验证后即可继续访问|去验证|当前环境异常/u.test(head);
 }
 
-/** The shape `POST /api/v1/extension/captures` answers with (only the fields a receipt needs). */
+/** The shape the two capture endpoints answer with (only the fields a receipt needs). */
 type CaptureResponse = {
   outcome?: string;
   chars?: number;
   images?: number;
   duplicate?: boolean;
+  admission?: CaptureAdmission | null;
+  sourceArticleId?: string | null;
+  libraryScope?: string;
+  textChars?: number;
   capture?: { id?: string; status?: string; title?: string | null } | null;
-  error?: { code?: string; message?: string };
+  error?: { code?: string; message?: string; details?: unknown };
 };
 
 /** True when the workbench said "I already have this one". */
 function isDuplicate(body: CaptureResponse): boolean {
   return body.duplicate === true || body.outcome === "duplicate";
+}
+
+/** Keep only outcomes the bridge knows how to explain. */
+function outcomeOf(body: CaptureResponse): CaptureOutcome | undefined {
+  const value = body.outcome;
+  return value === "accepted" || value === "pending" || value === "needs_manual" || value === "duplicate"
+    ? value
+    : undefined;
+}
+
+/** The admission block, when the response carried a usable one. */
+function admissionOf(body: CaptureResponse): CaptureAdmission | undefined {
+  return body.admission !== null && typeof body.admission === "object" ? body.admission : undefined;
+}
+
+/** Visible characters, counted the way D6 counts them (whitespace excluded). */
+export function visibleChars(text: string): number {
+  return text.replace(/\s+/gu, "").length;
 }
 
 /**
@@ -333,6 +441,10 @@ export async function postCapture(
       text: extracted.text,
       html: extracted.html === "" ? null : extracted.html,
       accountKind: "wechat",
+      // Personal library (migration 45): the workbench decides admission by D6;
+      // the account id is what lets it group articles under one 公众号.
+      libraryScope: "personal",
+      accountExternalId: extracted.biz,
       // Filed as pending: the inbox is where a human decides (D30 keeps it rejectable).
       mode: undefined,
     }),
@@ -351,6 +463,8 @@ export async function postCapture(
       ok: false,
       kind: "network",
       url: extracted.url,
+      via: "http",
+      degraded: false,
       message: `连不上工作台（${config.baseUrl}）：${String((err as Error).message ?? err).slice(0, 120)}`,
     };
   }
@@ -363,6 +477,8 @@ export async function postCapture(
       ok: false,
       kind: "server",
       url: extracted.url,
+      via: "http",
+      degraded: false,
       message: `工作台返回了非 JSON（HTTP ${res.status}）：${raw.slice(0, 120)}`,
     };
   }
@@ -373,12 +489,21 @@ export async function postCapture(
       ok: false,
       kind: res.status === 401 ? "config" : "http",
       url: extracted.url,
+      via: "http",
+      degraded: false,
       message: `${code}：${body.error?.message ?? `HTTP ${res.status}`}${hint}`,
     };
   }
   const id = body.capture?.id;
   if (typeof id !== "string" || id === "") {
-    return { ok: false, kind: "server", url: extracted.url, message: "工作台没有返回 capture id" };
+    return {
+      ok: false,
+      kind: "server",
+      url: extracted.url,
+      via: "http",
+      degraded: false,
+      message: "工作台没有返回 capture id",
+    };
   }
   const chars = typeof body.chars === "number" ? body.chars : extracted.text.length;
   return {
@@ -390,21 +515,141 @@ export async function postCapture(
     short: chars < SHORT_TEXT_CHARS,
     status: body.capture?.status ?? (body.outcome ?? "pending"),
     url: extracted.url,
+    via: "http",
+    degraded: false,
+    outcome: outcomeOf(body),
+    admission: admissionOf(body),
+    libraryScope: body.libraryScope === "personal" ? "personal" : undefined,
+    sourceArticleId: typeof body.sourceArticleId === "string" ? body.sourceArticleId : null,
   };
 }
 
-/** Read one URL and file it. The whole fast path, minus the message plumbing. */
-export async function captureUrl(
-  url: string,
+/**
+ * Ask the workbench to re-read a URL with the host browser (D4=A).
+ *
+ * The workbench owns extraction and admission; this side only sends the URL.
+ * This is slow (a real browser page), hence its own longer timeout.
+ */
+async function postBrowserCapture(
   config: CaptureConfig,
-  fetchImpl: FetchLike = fetch,
+  url: string,
+  fetchImpl: FetchLike,
 ): Promise<CaptureResult> {
-  if (!config.enabled || config.token.trim() === "") {
+  const endpoint = `${config.baseUrl.replace(/\/+$/u, "")}/api/v1/captures/browser`;
+  let res: Response;
+  try {
+    res = await fetchImpl(endpoint, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${config.token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ url }),
+      signal: AbortSignal.timeout(BROWSER_TIMEOUT_MS),
+    });
+  } catch (err) {
     return {
       ok: false,
-      kind: "config",
+      kind: "network",
       url,
-      message: "采集没开：设置里打开 captureEnabled，并填上工作台的 capture token",
+      via: "browser",
+      degraded: false,
+      message: `浏览器补抓失败：连不上工作台（${config.baseUrl}）：${String((err as Error).message ?? err).slice(0, 120)}`,
+    };
+  }
+  const raw = await res.text();
+  let body: CaptureResponse = {};
+  try {
+    body = raw === "" ? {} : (JSON.parse(raw) as CaptureResponse);
+  } catch {
+    return {
+      ok: false,
+      kind: "server",
+      url,
+      via: "browser",
+      degraded: false,
+      message: `浏览器补抓失败：工作台返回了非 JSON（HTTP ${res.status}）：${raw.slice(0, 120)}`,
+    };
+  }
+  if (!res.ok || body.error !== undefined) {
+    const code = body.error?.code ?? `http_${res.status}`;
+    const hint = res.status === 401 ? "（token 无效或过期，重新配对后再试）" : "";
+    return {
+      ok: false,
+      kind: res.status === 401 ? "config" : "http",
+      url,
+      via: "browser",
+      degraded: false,
+      message: `浏览器补抓失败：${code}：${body.error?.message ?? `HTTP ${res.status}`}${hint}`,
+    };
+  }
+  const id = body.capture?.id;
+  if (typeof id !== "string" || id === "") {
+    return {
+      ok: false,
+      kind: "server",
+      url,
+      via: "browser",
+      degraded: false,
+      message: "浏览器补抓失败：工作台没有返回 capture id",
+    };
+  }
+  const chars = typeof body.chars === "number"
+    ? body.chars
+    : typeof body.textChars === "number"
+      ? body.textChars
+      : (body.admission?.chars ?? 0);
+  return {
+    ok: true,
+    id,
+    title: body.capture?.title ?? null,
+    chars,
+    duplicate: isDuplicate(body),
+    short: chars < SHORT_TEXT_CHARS,
+    status: body.capture?.status ?? (body.outcome ?? "pending"),
+    url,
+    via: "browser",
+    degraded: false,
+    outcome: outcomeOf(body),
+    admission: admissionOf(body),
+    libraryScope: body.libraryScope === "personal" ? "personal" : undefined,
+    sourceArticleId: typeof body.sourceArticleId === "string" ? body.sourceArticleId : null,
+  };
+}
+
+/** Why the HTTP attempt is not good enough, and the browser should try. */
+type BrowserRetry = "unreadable" | "verification" | "too_short" | "needs_manual";
+
+/** D6 reasons the browser can actually fix; anything else (aggregator) needs a human. */
+const BROWSER_RETRY_REASONS: ReadonlySet<string> = new Set([
+  "too_short",
+  "verification_shell",
+  "shell_page",
+]);
+
+/** Browser fallback is on unless the config or the environment switched it off. */
+export function browserCaptureAllowed(config: CaptureConfig, env = process.env): boolean {
+  if (config.browserCapture === false) return false;
+  return browserCaptureFromEnv(env.WORKBENCH_BROWSER_CAPTURE);
+}
+
+/** The HTTP fast path plus the reason the browser might do better (if any). */
+async function attemptHttp(
+  url: string,
+  config: CaptureConfig,
+  fetchImpl: FetchLike,
+): Promise<{ result: CaptureResult; retry: BrowserRetry | null }> {
+  if (!config.enabled || config.token.trim() === "") {
+    return {
+      result: {
+        ok: false,
+        kind: "config",
+        url,
+        via: "http",
+        degraded: false,
+        message: "采集没开：设置里打开 captureEnabled，并填上工作台的 capture token",
+      },
+      retry: null,
     };
   }
   let page: FetchedPage;
@@ -412,32 +657,115 @@ export async function captureUrl(
     page = await fetchPage(url, fetchImpl);
   } catch (err) {
     return {
-      ok: false,
-      kind: "network",
-      url,
-      message: `打不开这个链接：${String((err as Error).message ?? err).slice(0, 120)}`,
+      result: {
+        ok: false,
+        kind: "network",
+        url,
+        via: "http",
+        degraded: false,
+        message: `打不开这个链接：${String((err as Error).message ?? err).slice(0, 120)}`,
+      },
+      retry: "unreadable",
     };
   }
   if (page.status < 200 || page.status >= 300 || page.html.trim() === "") {
     // D25: nothing is filed for a page we could not read; the receipt says why.
     return {
-      ok: false,
-      kind: "fetch",
-      url,
-      message: `抓不到正文（HTTP ${page.status}${page.status === 412 ? "，公众号要验证" : ""}）`,
+      result: {
+        ok: false,
+        kind: "fetch",
+        url,
+        via: "http",
+        degraded: false,
+        message: `抓不到正文（HTTP ${page.status}${page.status === 412 ? "，公众号要验证" : ""}）`,
+      },
+      retry: "unreadable",
     };
   }
   if (isVerificationShell(page)) {
-    return { ok: false, kind: "fetch", url, message: "抓不到正文（公众号要求先验证，等一下再试）" };
+    return {
+      result: {
+        ok: false,
+        kind: "fetch",
+        url,
+        via: "http",
+        degraded: false,
+        message: "抓不到正文（公众号要求先验证，等一下再试）",
+      },
+      retry: "verification",
+    };
   }
   const extracted = extractArticle(page.html, page.url);
   if (extracted.text.trim() === "") {
-    return { ok: false, kind: "fetch", url: extracted.url, message: "抓不到正文（页面里没有可读文字）" };
+    return {
+      result: {
+        ok: false,
+        kind: "fetch",
+        url: extracted.url,
+        via: "http",
+        degraded: false,
+        message: "抓不到正文（页面里没有可读文字）",
+      },
+      retry: "unreadable",
+    };
   }
   logger.info(
     `capture: ${extracted.url} title=${extracted.title ?? "(none)"} chars=${extracted.text.length} html=${extracted.html.length}`,
   );
-  return postCapture(config, extracted, fetchImpl);
+  const result = await postCapture(config, extracted, fetchImpl);
+  const tooShort = visibleChars(extracted.text) < PERSONAL_MIN_CHARS;
+  let retry: BrowserRetry | null = null;
+  if (result.ok) {
+    // A needs_manual verdict whose reason the browser can fix is the clearest
+    // signal; a short extraction is the pre-emptive one (D6 is 800 chars).
+    if (result.outcome === "needs_manual") {
+      const reason = result.admission?.reason;
+      if (typeof reason === "string" && BROWSER_RETRY_REASONS.has(reason)) retry = "needs_manual";
+    }
+    if (retry === null && tooShort) retry = "too_short";
+  } else if (tooShort && result.kind !== "config") {
+    retry = "too_short";
+  }
+  return { result, retry };
+}
+
+/**
+ * Read one URL and file it through the HTTP fast path only.
+ *
+ * Kept as the pure HTTP attempt (`#入库` and the link fast path call
+ * `captureWithFallback`); the result still carries `via: "http"` so receipts
+ * stay honest about where it came from.
+ */
+export async function captureUrl(
+  url: string,
+  config: CaptureConfig,
+  fetchImpl: FetchLike = fetch,
+): Promise<CaptureResult> {
+  return (await attemptHttp(url, config, fetchImpl)).result;
+}
+
+/**
+ * File one URL, letting the workbench re-read it in the host browser when the
+ * HTTP page cannot pass personal-library admission.
+ *
+ * The HTTP attempt still runs first and still reports its own failure; the
+ * browser is only a second source. When both fail, `degraded` is true and the
+ * receipt says the capture can be handled by hand in the workbench inbox.
+ */
+export async function captureWithFallback(
+  config: CaptureConfig,
+  url: string,
+  fetchImpl: FetchLike = fetch,
+): Promise<CaptureResult> {
+  const attempt = await attemptHttp(url, config, fetchImpl);
+  if (attempt.retry === null || !browserCaptureAllowed(config)) return attempt.result;
+  logger.info(`capture: ${url} browser fallback (${attempt.retry})`);
+  const browser = await postBrowserCapture(config, url, fetchImpl);
+  if (browser.ok) return browser;
+  const landed = attempt.result.ok
+    && (attempt.result.outcome === "accepted" || attempt.result.outcome === "duplicate");
+  if (landed) return { ...attempt.result, browserError: browser.message };
+  return { ...attempt.result, degraded: true, browserError: browser.message };
 }
 
 // ------------------------------------------------------------------ the ledger
@@ -544,6 +872,105 @@ export async function rejectCapture(
   return { ok: false, kind: "server", message: `${body.error?.code ?? `http_${res.status}`}：${detail}` };
 }
 
+/** What undoing a `#入库` learned from the workbench. */
+export type UndoCaptureResult =
+  | {
+      readonly ok: true;
+      readonly id: string;
+      readonly already: boolean;
+      /** `withdraw` is the personal-library route; `reject` is the old inbox route. */
+      readonly via: "withdraw" | "reject";
+      readonly sourceArticleId?: string | null;
+      readonly removedDocuments?: number;
+    }
+  | {
+      readonly ok: false;
+      readonly kind: RejectFailure;
+      readonly message: string;
+      /** Present when the personal material is still cited by articles. */
+      readonly articles?: readonly string[];
+    };
+
+type WithdrawResponse = {
+  ok?: boolean;
+  sourceArticleId?: string | null;
+  removedDocuments?: number;
+  error?: { code?: string; message?: string; details?: { articles?: unknown } };
+};
+
+/** The article ids in a withdraw 409, when the workbench listed them. */
+function citedArticles(body: WithdrawResponse): string[] {
+  const raw = body.error?.details?.articles;
+  return Array.isArray(raw) ? raw.filter((value): value is string => typeof value === "string" && value !== "") : [];
+}
+
+/**
+ * Take one capture back out, preferring the personal-library withdraw route.
+ *
+ * `withdraw` is the D16 operation: a personal material that no article cites can
+ * be removed (and its KB documents with it). When the route is missing (older
+ * workbench), answers 409 for a capture that was never accepted, or fails for
+ * any other reason, the old extension `reject` route is tried so the inbox undo
+ * keeps working. A 409 that lists citing articles is final: material that is in
+ * use must be unlinked in the workbench, not deleted from here.
+ */
+export async function undoCapture(
+  captureId: string,
+  config: CaptureConfig,
+  fetchImpl: FetchLike = fetch,
+): Promise<UndoCaptureResult> {
+  if (!config.enabled || config.token.trim() === "") {
+    return { ok: false, kind: "config", message: "采集没开或没有 token，撤不了" };
+  }
+  const endpoint =
+    `${config.baseUrl.replace(/\/+$/u, "")}/api/v1/extension/captures/${encodeURIComponent(captureId)}/withdraw`;
+  let res: Response;
+  try {
+    res = await fetchImpl(endpoint, {
+      method: "POST",
+      headers: { authorization: `Bearer ${config.token}` },
+      signal: AbortSignal.timeout(POST_TIMEOUT_MS),
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      kind: "network",
+      message: `连不上工作台（${config.baseUrl}）：${String((err as Error).message ?? err).slice(0, 120)}`,
+    };
+  }
+  const raw = await res.text();
+  let body: WithdrawResponse = {};
+  try {
+    body = raw === "" ? {} : (JSON.parse(raw) as WithdrawResponse);
+  } catch {
+    body = {};
+  }
+  if (res.ok) {
+    return {
+      ok: true,
+      id: captureId,
+      already: false,
+      via: "withdraw",
+      sourceArticleId: typeof body.sourceArticleId === "string" ? body.sourceArticleId : null,
+      ...(typeof body.removedDocuments === "number" ? { removedDocuments: body.removedDocuments } : {}),
+    };
+  }
+  const articles = citedArticles(body);
+  if (res.status === 409 && articles.length > 0) {
+    return {
+      ok: false,
+      kind: "conflict",
+      message: `已被 ${articles.length} 篇文章引用，不能撤销`,
+      articles,
+    };
+  }
+  // 404/405 = the route is not there; 409 without articles = the capture was
+  // never accepted. Both, and any other response, keep the old reject behaviour.
+  const rejected = await rejectCapture(captureId, config, fetchImpl);
+  if (!rejected.ok) return rejected;
+  return { ok: true, id: captureId, already: rejected.already, via: "reject" };
+}
+
 // ------------------------------------------------------------------ the receipt
 
 /** The short id a receipt shows: enough to find the capture, short enough for a phone. */
@@ -551,22 +978,71 @@ export function shortId(id: string): string {
   return id.replace(/-/gu, "").slice(0, 6);
 }
 
+/** Why D6 admission did not happen, in one short Chinese phrase. */
+function admissionReasonText(admission: CaptureAdmission | undefined): string {
+  const reason = admission?.reason ?? "";
+  const chars = typeof admission?.chars === "number" ? admission.chars : undefined;
+  if (reason === "too_short") {
+    return chars === undefined ? `正文不足 ${PERSONAL_MIN_CHARS} 字` : `正文 ${chars} 字不足 ${PERSONAL_MIN_CHARS}`;
+  }
+  if (reason === "verification_shell") return "公众号要求验证，抓到的不是正文";
+  if (reason === "shell_page") return "正文没有成句，疑似栏目/壳页";
+  if (reason === "aggregator_page") return "疑似聚合/门户页，需要人工确认";
+  if (reason === "invalid_url") return "链接不是可抓的 http(s) 页面";
+  const detail = admission?.detail?.trim();
+  return detail !== undefined && detail !== "" ? detail.slice(0, 80) : "自动接纳没通过";
+}
+
+/** Keep the browser's failure to one short receipt line. */
+function shortBrowserError(message: string | undefined): string | undefined {
+  if (message === undefined) return undefined;
+  const text = message.replace(/\s+/gu, " ").replace(/^浏览器补抓失败：/u, "").trim().slice(0, 50);
+  return text === "" ? undefined : text;
+}
+
 /**
  * What the user reads back on WeChat.
  *
  * Three outcomes (D25): filed, already filed, or not filed at all — and a filed
  * page whose text is suspiciously short says so, because that is usually a
- * verification shell rather than an article.
+ * verification shell rather than an article. Personal-library captures add the
+ * D6 admission verdict; a browser capture says so, and a failed fallback calls
+ * itself a degradation instead of a success.
  */
 export function captureReceipt(result: CaptureResult): string {
   if (!result.ok) {
     const head = result.kind === "config" ? "采集没配置好" : "没能入库";
-    return [head, result.message, "", result.url].filter((line) => line !== undefined).join("\n");
+    const browserError = shortBrowserError(result.browserError);
+    const degraded = result.degraded
+      ? `已降级：稍后可在工作台收件箱手动处理${browserError === undefined ? "" : `（浏览器补抓失败：${browserError}）`}`
+      : undefined;
+    return [head, result.message, degraded, "", result.url]
+      .filter((line) => line !== undefined)
+      .join("\n");
   }
   const title = result.title?.trim() || "(没有标题)";
   const short = result.short ? "，正文偏短，可能抓到的是验证页" : "";
+  const id = shortId(result.id);
   if (result.duplicate) {
-    return `已经在收件箱里了：《${title}》 · ${result.chars} 字 · ${shortId(result.id)}（没有新建）`;
+    const library = result.libraryScope === "personal" ? "个人库" : "收件箱";
+    return [
+      `已经在${library}里了：《${title}》 · ${result.chars} 字 · ${id}（没有新建）`,
+      ...(result.via === "browser" ? ["↻ 浏览器补抓成功"] : []),
+    ].join("\n");
   }
-  return `已进收件箱：《${title}》 · ${result.chars} 字 · ${shortId(result.id)}${short}`;
+  const lines: string[] = [];
+  if (result.outcome === "needs_manual") {
+    lines.push(`已放收件箱：《${title}》 · ${result.chars} 字 · ${id}`);
+    lines.push(`未自动进个人库：${admissionReasonText(result.admission)}`);
+  } else {
+    const personal = result.libraryScope === "personal" && result.outcome === "accepted";
+    const verb = result.degraded ? "已放" : "已进";
+    lines.push(`${verb}${personal ? "个人库" : "收件箱"}：《${title}》 · ${result.chars} 字 · ${id}${short}`);
+  }
+  if (result.via === "browser") lines.push("↻ 浏览器补抓成功");
+  if (result.degraded) {
+    const browserError = shortBrowserError(result.browserError);
+    lines.push(`已降级：稍后可在工作台收件箱手动处理${browserError === undefined ? "" : `（浏览器补抓失败：${browserError}）`}`);
+  }
+  return lines.join("\n");
 }

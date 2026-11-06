@@ -28,12 +28,19 @@ const {
   extractArticle,
   trimHtml,
   captureUrl,
+  captureWithFallback,
   rejectCapture,
+  undoCapture,
   captureLedgerDraft,
   captureReceipt,
   shortId,
   SHORT_TEXT_CHARS,
+  PERSONAL_MIN_CHARS,
 } = await import(join(ROOT, "lib/capture.js"));
+
+// The suite checks both sides of the switch; keep the ambient environment from
+// deciding which one runs.
+delete process.env.WORKBENCH_BROWSER_CAPTURE;
 
 let pass = 0;
 const failures = [];
@@ -72,6 +79,20 @@ check("firstUrl on plain text", firstUrl("没有链接") === null);
 check("captureReady needs the switch", captureReady({ captureEnabled: false, captureToken: "t" }) === false);
 check("captureReady needs a token", captureReady({ captureEnabled: true, captureToken: "  " }) === false);
 check("captureReady when both", captureReady({ captureEnabled: true, captureToken: "t" }) === true);
+
+// The host-browser fallback is on unless the setting or the env says otherwise.
+const { browserCaptureFromEnv, normalizeConfig } = await import(join(ROOT, "lib/config.js"));
+check("browser capture is on when the env is unset", browserCaptureFromEnv(undefined) === true);
+check("browser capture is on for an empty env", browserCaptureFromEnv("") === true);
+for (const off of ["0", "false", "off", "no", " OFF "]) {
+  check(`browser capture is off for ${JSON.stringify(off)}`, browserCaptureFromEnv(off) === false);
+}
+check("browser capture is on for other env values", browserCaptureFromEnv("1") === true && browserCaptureFromEnv("yes") === true);
+check(
+  "the setting keeps an explicit switch",
+  normalizeConfig({ browserCapture: false }).browserCapture === false
+    && normalizeConfig({ browserCapture: true }).browserCapture === true,
+);
 
 // ---------------------------------------------------------------- extraction
 
@@ -125,7 +146,31 @@ equal("article publisher", article.publisher, "某公众号");
 equal("article publishedAt is ms", article.publishedAt, 1699948800 * 1000);
 check("article text has the body", article.text.includes("第一段文字") && article.text.includes("第二段 & 实体"));
 check("article html drops scripts", !article.html.includes("<script>"));
+equal("article biz falls back to og:url when var biz is empty", article.biz, "MzA5");
 check("short link input keeps its own url when the page has no canonical", extractArticle("<p>x</p>", "https://example.com/a").url === "https://example.com/a");
+check("short link input has no biz", extractArticle("<p>x</p>", "https://mp.weixin.qq.com/s/xxxx").biz === null);
+
+// biz: the page's own declaration wins, and the value is URL-decoded.
+equal(
+  "biz from var biz with spaces and a short quote",
+  extractArticle('<script>var  biz ="MzA5%3D%3D";</script>', LONG).biz,
+  "MzA5==",
+);
+equal(
+  "biz from var biz when the page has no og:url",
+  extractArticle('<script>var biz = "MzA5MTIz%2Babc";</script>', "https://mp.weixin.qq.com/s/Short").biz,
+  "MzA5MTIz+abc",
+);
+equal(
+  "biz from og:url",
+  extractArticle(
+    `<meta property="og:url" content="https://mp.weixin.qq.com/s?__biz=MzA5%3D%3D&amp;mid=1&amp;idx=1&amp;sn=x" />`,
+    "https://mp.weixin.qq.com/s/Short",
+  ).biz,
+  "MzA5==",
+);
+equal("biz from the source URL", extractArticle("<p>x</p>", LONG).biz, "MzA5");
+check("a short link has no biz to report", extractArticle("<p>x</p>", "https://mp.weixin.qq.com/s/abc").biz === null);
 
 const big = `<p>${"字".repeat(4_000_000)}</p>`;
 check("an oversized page is dropped rather than truncated", trimHtml(big) === "");
@@ -177,6 +222,8 @@ const payload = JSON.parse(form.get("payload"));
 equal("payload url is canonical", payload.url, LONG);
 equal("payload title", payload.title, "标题 & 副题");
 equal("payload accountKind", payload.accountKind, "wechat");
+equal("payload is a personal-library capture", payload.libraryScope, "personal");
+equal("payload carries the 公众号 biz", payload.accountExternalId, "MzA5");
 check("payload has no mode (files it pending)", !("mode" in payload));
 check("payload carries html", typeof payload.html === "string" && payload.html.includes("第一段"));
 check("payload text is the article", payload.text.includes("第一段文字"));
@@ -293,6 +340,204 @@ const noId = await captureUrl(
 );
 check("a response without an id is a server failure", noId.ok === false && noId.kind === "server");
 
+// ------------------------------------------- personal library + browser fallback (D4=A / D6)
+
+const BROWSER_ENDPOINT = "http://127.0.0.1:9999/api/v1/captures/browser";
+const SIX_HUNDRED = `<html><head>
+<meta property="og:title" content="六百字" />
+<meta property="og:url" content="https://mp.weixin.qq.com/s?__biz=MzA5&amp;mid=2656000&amp;idx=1&amp;sn=abc123" />
+</head><body><div id="js_content"><p>${"字".repeat(600)}</p></div></body></html>`;
+const needsManual = (chars = 600) =>
+  okResponse(
+    {
+      outcome: "needs_manual",
+      libraryScope: "personal",
+      chars,
+      admission: { admit: false, chars, reason: "too_short", detail: `可见正文 ${chars} 字 < ${PERSONAL_MIN_CHARS}` },
+      capture: { id: "http-short", status: "pending", title: "六百字" },
+    },
+    201,
+  );
+const browserAccepted = (id, title, chars = 1200) =>
+  okResponse(
+    {
+      outcome: "accepted",
+      libraryScope: "personal",
+      chars,
+      capture: { id, status: "accepted", title },
+      sourceArticleId: "sa-browser",
+    },
+    201,
+  );
+
+// HTTP fetch failed: the workbench's host browser is the only way to get the page.
+calls.length = 0;
+const afterFetchFailure = await captureWithFallback(
+  CONFIG,
+  LONG,
+  stub([
+    { match: (url) => url.includes("mp.weixin.qq.com"), reply: () => { throw new Error("ENETUNREACH"); } },
+    { match: (url) => url.endsWith("/api/v1/captures/browser"), reply: () => browserAccepted("browser-1", "浏览器版") },
+  ]),
+);
+check(
+  "an HTTP failure still reaches the browser",
+  afterFetchFailure.ok === true && afterFetchFailure.via === "browser",
+  JSON.stringify(afterFetchFailure),
+);
+check("a successful browser capture is not degraded", afterFetchFailure.ok && afterFetchFailure.degraded === false);
+equal("the browser result has an id", afterFetchFailure.ok ? shortId(afterFetchFailure.id) : "", "browse");
+equal("the browser request goes to the workbench", calls.at(-1).url, BROWSER_ENDPOINT);
+equal("the browser request body is just the URL", JSON.parse(calls.at(-1).init.body), { url: LONG });
+equal("the browser request carries the bearer", calls.at(-1).init.headers.authorization, "Bearer tok");
+equal("the browser request is a POST", calls.at(-1).init.method, "POST");
+
+// A page that clears D6 is filed by HTTP and never opens the browser.
+const NINE_HUNDRED = SIX_HUNDRED.replace("字".repeat(600), "字".repeat(900));
+calls.length = 0;
+const normalPersonal = await captureWithFallback(
+  CONFIG,
+  LONG,
+  stub([
+    { match: (url) => url.includes("mp.weixin.qq.com"), reply: () => new Response(NINE_HUNDRED, { status: 200 }) },
+    {
+      match: (url) => url.endsWith("/api/v1/extension/captures"),
+      reply: () =>
+        okResponse({
+          outcome: "accepted",
+          libraryScope: "personal",
+          chars: 900,
+          capture: { id: "http-long", status: "accepted", title: "九百字" },
+          sourceArticleId: "sa-http",
+        }),
+    },
+  ]),
+);
+check("a normal personal capture stays on HTTP", normalPersonal.ok && normalPersonal.via === "http" && normalPersonal.degraded === false, JSON.stringify(normalPersonal));
+equal("no browser request for a long page", calls.length, 2);
+check("its receipt says 个人库 without a browser line", captureReceipt(normalPersonal).includes("已进个人库") && !captureReceipt(normalPersonal).includes("浏览器补抓"), captureReceipt(normalPersonal));
+
+// A 600-char HTTP body cannot pass D6; the workbench says needs_manual, so the
+// bridge asks the host browser for the real page.
+calls.length = 0;
+const browserAfterShort = await captureWithFallback(
+  CONFIG,
+  LONG,
+  stub([
+    { match: (url) => url.includes("mp.weixin.qq.com"), reply: () => new Response(SIX_HUNDRED, { status: 200 }) },
+    { match: (url) => url.endsWith("/api/v1/extension/captures"), reply: () => needsManual() },
+    { match: (url) => url.endsWith("/api/v1/captures/browser"), reply: () => browserAccepted("browser-2", "浏览器版") },
+  ]),
+);
+check(
+  "a 600-char HTTP page triggers the browser",
+  browserAfterShort.ok === true && browserAfterShort.via === "browser",
+  JSON.stringify(browserAfterShort),
+);
+equal("the browser is asked for the same URL", JSON.parse(calls[2].init.body).url, LONG);
+const browserReceipt = captureReceipt(browserAfterShort);
+check("a browser capture receipt says the browser helped", browserReceipt.includes("↻ 浏览器补抓成功"), browserReceipt);
+check("a personal-library capture says 个人库", browserReceipt.includes("已进个人库"), browserReceipt);
+const plainPersonal = {
+  ok: true,
+  id: "abcdef12-0000",
+  title: "六百字",
+  chars: 1200,
+  duplicate: false,
+  short: false,
+  status: "accepted",
+  url: LONG,
+  via: "http",
+  degraded: false,
+  outcome: "accepted",
+  libraryScope: "personal",
+};
+check(
+  "a browser receipt stays within twice the plain receipt",
+  browserReceipt.length <= captureReceipt(plainPersonal).length * 2,
+  `${browserReceipt.length} vs ${captureReceipt(plainPersonal).length}`,
+);
+
+// The browser is also tried when HTTP says needs_manual; if it fails too, the
+// receipt must call it a degradation, not a success.
+calls.length = 0;
+const degraded = await captureWithFallback(
+  CONFIG,
+  LONG,
+  stub([
+    { match: (url) => url.includes("mp.weixin.qq.com"), reply: () => new Response(SIX_HUNDRED, { status: 200 }) },
+    { match: (url) => url.endsWith("/api/v1/extension/captures"), reply: () => needsManual() },
+    {
+      match: (url) => url.endsWith("/api/v1/captures/browser"),
+      reply: () => okResponse({ error: { code: "provider_unavailable", message: "browser-assist is not configured" } }, 502),
+    },
+  ]),
+);
+check(
+  "both sources failing is degraded",
+  degraded.ok === true && degraded.via === "http" && degraded.degraded === true,
+  JSON.stringify(degraded),
+);
+check("the browser failure is kept for the receipt", degraded.ok && degraded.browserError?.includes("provider_unavailable"), degraded.browserError);
+const degradedReceipt = captureReceipt(degraded);
+check("the degraded receipt says so", degradedReceipt.includes("已降级") && degradedReceipt.includes("手动处理"), degradedReceipt);
+check("the degraded receipt still explains admission", degradedReceipt.includes("正文 600 字不足 800"), degradedReceipt);
+check("the degraded receipt does not claim admission", !degradedReceipt.includes("已进个人库"), degradedReceipt);
+
+// An unreadable page plus a dead browser is a degraded failure (not a success).
+calls.length = 0;
+const bothDown = await captureWithFallback(
+  CONFIG,
+  LONG,
+  stub([
+    { match: (url) => url.includes("mp.weixin.qq.com"), reply: () => new Response("", { status: 502 }) },
+    {
+      match: (url) => url.endsWith("/api/v1/captures/browser"),
+      reply: () => okResponse({ error: { code: "provider_unavailable", message: "browser-assist is not configured" } }, 400),
+    },
+  ]),
+);
+check("a failed page and a failed browser are a degraded failure", bothDown.ok === false && bothDown.degraded === true, JSON.stringify(bothDown));
+check("its receipt says it is degraded", captureReceipt(bothDown).includes("已降级"), captureReceipt(bothDown));
+
+// WORKBENCH_BROWSER_CAPTURE=0 is the global kill switch: no browser request at all.
+const savedBrowserEnv = process.env.WORKBENCH_BROWSER_CAPTURE;
+process.env.WORKBENCH_BROWSER_CAPTURE = "0";
+try {
+  calls.length = 0;
+  const envOff = await captureWithFallback(
+    CONFIG,
+    LONG,
+    stub([
+      { match: (url) => url.includes("mp.weixin.qq.com"), reply: () => new Response(SIX_HUNDRED, { status: 200 }) },
+      { match: (url) => url.endsWith("/api/v1/extension/captures"), reply: () => needsManual() },
+    ]),
+  );
+  check("the env kill switch keeps the HTTP result", envOff.ok && envOff.via === "http", JSON.stringify(envOff));
+  equal("the env kill switch sends no browser request", calls.length, 2);
+} finally {
+  if (savedBrowserEnv === undefined) delete process.env.WORKBENCH_BROWSER_CAPTURE;
+  else process.env.WORKBENCH_BROWSER_CAPTURE = savedBrowserEnv;
+}
+
+// The settings flag is the same switch for one config object.
+calls.length = 0;
+const configOff = await captureWithFallback(
+  { ...CONFIG, browserCapture: false },
+  LONG,
+  stub([
+    { match: (url) => url.includes("mp.weixin.qq.com"), reply: () => new Response(SIX_HUNDRED, { status: 200 }) },
+    { match: (url) => url.endsWith("/api/v1/extension/captures"), reply: () => needsManual() },
+  ]),
+);
+equal("browserCapture:false sends no browser request", calls.length, 2);
+const manualReceipt = captureReceipt(configOff);
+check(
+  "a needs_manual receipt explains the admission reason",
+  manualReceipt.includes("已放收件箱") && manualReceipt.includes("正文 600 字不足 800"),
+  manualReceipt,
+);
+
 // A declared-huge response is refused before it is read (a phone link can point anywhere).
 const huge = await captureUrl(
   "https://example.com/huge",
@@ -375,6 +620,47 @@ check("a workbench that is down is a network failure", downWorkbench.ok === fals
 
 const noToken = await rejectCapture("cap-1234", { ...CONFIG, token: "  " });
 check("without a token nothing is attempted", noToken.ok === false && noToken.kind === "config");
+
+// ------------------------------------------- withdrawing personal material (D16)
+
+const withdrawReply = (status, body) =>
+  stub([{ match: (url) => url.includes("/withdraw"), reply: () => (body === undefined ? new Response("", { status }) : okResponse(body, status)) }]);
+
+calls.length = 0;
+const withdrawn = await undoCapture("cap-1234", CONFIG, withdrawReply(200, {
+  ok: true,
+  sourceArticleId: "sa-9",
+  removedDocuments: 3,
+}));
+check("withdraw 200 is a successful undo", withdrawn.ok === true && withdrawn.via === "withdraw", JSON.stringify(withdrawn));
+check("the withdraw result names the material", withdrawn.ok && withdrawn.sourceArticleId === "sa-9" && withdrawn.removedDocuments === 3);
+check("the undo calls the withdraw route", calls[0].url === "http://127.0.0.1:9999/api/v1/extension/captures/cap-1234/withdraw", calls[0].url);
+check("withdraw is a POST with the bearer", calls[0].init.method === "POST" && String(calls[0].init.headers.authorization) === "Bearer tok");
+check("withdraw does not fall back when it succeeded", calls.length === 1);
+
+calls.length = 0;
+const cited = await undoCapture("cap-1234", CONFIG, withdrawReply(409, {
+  error: { code: "conflict", message: "source is already cited by articles", details: { articles: ["art-1", "art-2"] } },
+}));
+check("a cited material cannot be withdrawn", cited.ok === false && cited.kind === "conflict", JSON.stringify(cited));
+check("the conflict lists the citing articles", cited.ok === false && cited.articles?.length === 2, JSON.stringify(cited));
+check("the conflict message counts the articles", cited.message.includes("已被 2 篇文章引用"), cited.message);
+check("a cited conflict does not fall back to reject", calls.length === 1);
+
+calls.length = 0;
+const missingWithdraw = await undoCapture("cap-1234", CONFIG, stub([
+  { match: (url) => url.includes("/withdraw"), reply: () => new Response("", { status: 404 }) },
+  { match: (url) => url.includes("/reject"), reply: () => okResponse({ ok: true }, 200) },
+]));
+check("a missing withdraw route falls back to reject", missingWithdraw.ok === true && missingWithdraw.via === "reject", JSON.stringify(missingWithdraw));
+equal("the fallback order is withdraw then reject", calls.map((call) => (call.url.includes("/withdraw") ? "withdraw" : "reject")), ["withdraw", "reject"]);
+
+calls.length = 0;
+const unaccepted = await undoCapture("cap-1234", CONFIG, stub([
+  { match: (url) => url.includes("/withdraw"), reply: () => okResponse({ error: { code: "conflict", message: "capture has not been accepted yet" } }, 409) },
+  { match: (url) => url.includes("/reject"), reply: () => okResponse({ ok: true, alreadyRejected: true }, 200) },
+]));
+check("a 409 without articles falls back to reject", unaccepted.ok === true && unaccepted.via === "reject" && unaccepted.already === true, JSON.stringify(unaccepted));
 
 // ---------------------------------------------------------------- report
 

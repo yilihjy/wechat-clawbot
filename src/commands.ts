@@ -328,12 +328,18 @@ async function fileLink(deps: CommandDeps, arg: string): Promise<string> {
   const result = await deps.capture(url);
   if (result.ok) {
     const title = result.title?.trim() || "(没有标题)";
+    const where = result.outcome === "needs_manual"
+      ? "已放收件箱（未自动进个人库）"
+      : result.libraryScope === "personal" && result.outcome === "accepted"
+        ? "已进个人库"
+        : "已进收件箱";
     deps.note?.(
-      `[命令] ${clockText((deps.now ?? Date.now)())} #入库 → 已进收件箱《${title}》（capture ${result.id.slice(0, 6).replace(/-/gu, "")}${result.duplicate ? "，本来就有" : ""}）`,
+      `[命令] ${clockText((deps.now ?? Date.now)())} #入库 → ${where}《${title}》（capture ${result.id.slice(0, 6).replace(/-/gu, "")}${result.duplicate ? "，本来就有" : ""}）`,
     );
   }
-  // Only a pending capture can be taken back (D30); the workbench answers 409 for
-  // one that was already accepted, and the undo says so.
+  // A personal material can be withdrawn while no article cites it; a pending
+  // inbox capture still goes through the old reject route. Either way the ledger
+  // line carries the capture id, so it stays undoable (D30).
   record(deps, captureLedgerDraft(result, url, "入库"));
   return captureReceipt(result);
 }

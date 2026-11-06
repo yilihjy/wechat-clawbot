@@ -14,7 +14,7 @@
 import type { Context } from "@deepseek-ai/cordis";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 
-import { rejectCapture, type CaptureConfig } from "./capture.js";
+import { undoCapture, type CaptureConfig } from "./capture.js";
 import { clockOf } from "./timeline.js";
 import type { CommandLedger, LedgerEntry, LedgerUndo } from "./ledger.js";
 import type { ModeStore } from "./modes.js";
@@ -62,8 +62,13 @@ export async function undoEntry(
   const label = undoLabel(undo);
 
   if (undo.kind === "capture") {
-    const result = await rejectCapture(undo.captureId, deps.capture);
-    if (!result.ok) return { ok: false, message: `没能撤掉${label}：${result.message}` };
+    const result = await undoCapture(undo.captureId, deps.capture);
+    if (!result.ok) {
+      const cited = result.articles?.length ?? 0;
+      if (cited > 0) return { ok: false, message: `没能撤掉${label}：已被 ${cited} 篇文章引用，不能撤销。` };
+      return { ok: false, message: `没能撤掉${label}：${result.message}` };
+    }
+    if (result.via === "withdraw") return { ok: true, message: `已撤销${label}（移出个人库）。` };
     return { ok: true, message: result.already ? `${label}早就撤过了，收件箱里没有它。` : `已从收件箱撤掉${label}。` };
   }
 
@@ -165,9 +170,10 @@ export function registerLedgerTools(agentCtx: Context, deps: LedgerToolDeps): vo
     defineTool({
       name: "undo_command",
       description:
-        "Undo one earlier WeChat command. Only #入库 (while the capture is still pending), #接管 and #交还 "
-        + "can be undone; #新会话, #停一下 and read-only commands cannot. Call with no arguments to undo the "
-        + "only candidate, or when it answers that there are several, call again with the index it listed.",
+        "Undo one earlier WeChat command. Only #入库 (when its personal material is not cited by any "
+        + "article), #接管 and #交还 can be undone; #新会话, #停一下 and read-only commands cannot. "
+        + "Call with no arguments to undo the only candidate, or when it answers that there are several, "
+        + "call again with the index it listed.",
       parameters: {
         which: { type: "number", description: "1-based index from the candidate list the tool returned." },
       },

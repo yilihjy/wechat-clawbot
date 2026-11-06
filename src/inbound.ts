@@ -21,7 +21,7 @@ import { PendingRegistry } from "./pending.js";
 import { loadContextToken, saveContextToken } from "./state.js";
 import { logger } from "./ilink/util/logger.js";
 import { routeInboundCommand, runCommand, stripEscape, unknownCommandReply, WRITE_COMMANDS } from "./commands.js";
-import { captureLedgerDraft, captureReady, captureReceipt, captureUrl, detectCapture } from "./capture.js";
+import { captureLedgerDraft, captureReady, captureReceipt, captureWithFallback, detectCapture } from "./capture.js";
 import { looksLikeApprovalWord } from "./approvals.js";
 import { cancelDshSession } from "./dsh-sessions.js";
 import type { CommandLedger, LedgerDraft } from "./ledger.js";
@@ -523,11 +523,12 @@ export class InboundRouter {
 
   /** Read one URL and file it (the capture fast path, shared with `#入库`). */
   private async captureOne(url: string) {
-    return captureUrl(url, {
+    return captureWithFallback({
       enabled: this.config.captureEnabled,
       baseUrl: this.config.captureBaseUrl,
       token: this.config.captureToken,
-    });
+      browserCapture: this.config.browserCapture,
+    }, url);
   }
 
   /**

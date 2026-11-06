@@ -52,21 +52,55 @@ const captureEntry = (id) =>
 
 const realFetch = globalThis.fetch;
 try {
-  globalThis.fetch = async () => new Response("", { status: 404 });
   const entry = captureEntry("cap-1");
+  const reply = (status, body) =>
+    body === undefined
+      ? new Response("", { status })
+      : new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+  // The undo now tries withdraw first, then the old reject route.
+  const route = ({ withdraw, reject }) =>
+    async (url) => {
+      const handler = url.includes("/withdraw") ? withdraw : url.includes("/reject") ? reject : undefined;
+      if (handler === undefined) throw new Error(`unexpected fetch ${url}`);
+      return typeof handler === "function" ? handler() : handler;
+    };
+
+  globalThis.fetch = route({ withdraw: reply(404), reject: reply(404) });
   const missingRoute = await undoEntry(entry, deps);
   check("a workbench without the route says so", !missingRoute.ok && missingRoute.message.includes("还没有撤销端点"), missingRoute.message);
   check("the failure names what it tried to undo", missingRoute.message.includes("《一篇》"), missingRoute.message);
 
-  globalThis.fetch = async () => new Response("", { status: 200 });
+  globalThis.fetch = route({ withdraw: reply(404), reject: reply(200) });
   const done = await undoEntry(entry, deps);
-  check("a rejected capture is reported as undone", done.ok && done.message.includes("已从收件箱撤掉《一篇》"), done.message);
+  check("an old inbox capture is reported as undone", done.ok && done.message.includes("已从收件箱撤掉《一篇》"), done.message);
 
-  globalThis.fetch = async () => new Response(JSON.stringify({ ok: true, alreadyRejected: true }), { status: 200 });
+  globalThis.fetch = route({ withdraw: reply(200, { ok: true, sourceArticleId: "sa-1", removedDocuments: 2 }), reject: reply(500) });
+  const withdrawn = await undoEntry(entry, deps);
+  check(
+    "a personal material is reported as withdrawn",
+    withdrawn.ok && withdrawn.message.includes("已撤销《一篇》（移出个人库）"),
+    withdrawn.message,
+  );
+
+  globalThis.fetch = route({ withdraw: reply(404), reject: reply(200, { ok: true, alreadyRejected: true }) });
   const again = await undoEntry(entry, deps);
   check("a second undo says it was already gone", again.ok && again.message.includes("早就撤过了"), again.message);
 
-  globalThis.fetch = async () => new Response(JSON.stringify({ error: { code: "conflict", message: "accepted" } }), { status: 409 });
+  globalThis.fetch = route({
+    withdraw: reply(409, { error: { code: "conflict", message: "source is already cited by articles", details: { articles: ["a-1", "a-2"] } } }),
+    reject: reply(500),
+  });
+  const cited = await undoEntry(entry, deps);
+  check(
+    "material cited by articles cannot be undone",
+    !cited.ok && cited.message.includes("已被 2 篇文章引用，不能撤销"),
+    cited.message,
+  );
+
+  globalThis.fetch = route({
+    withdraw: reply(404),
+    reject: reply(409, { error: { code: "conflict", message: "accepted" } }),
+  });
   const conflict = await undoEntry(entry, deps);
   check("an accepted capture cannot be undone", !conflict.ok && conflict.message.includes("accepted"), conflict.message);
 } finally {
