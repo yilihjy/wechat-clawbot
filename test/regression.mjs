@@ -1248,6 +1248,8 @@ function check(name, ok, detail) {
       deps: { getAccount: () => ({ userId: "owner" }) },
       ctx: { agents: { get: () => undefined } },
       installSelection() {}, ensureTools() {},
+      // The silent guard (2026-11-08) runs on every session event of this bridge.
+      armApprovalGuard() {}, clearApprovalGuard() {},
     };
     WechatBridge.prototype.onSessionEvent.call(fake, { id: "S" },
       { type: "user/message", seq: 1, data: { source: { kind: "schedule" } } });

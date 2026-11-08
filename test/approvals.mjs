@@ -138,6 +138,7 @@ function harness({
   // object, so a test can take the bridge away and still ask what happens.
   bridge = true,
   owner = undefined,
+  sendText = undefined,
 } = {}) {
   const pending = new PendingRegistry();
   const sent = [];
@@ -145,9 +146,9 @@ function harness({
     config: { approvalTimeoutMs: timeoutMs, sessionId: "a1" },
     getBridge: () => (bridge ? { isWechatSession: (id) => id === "a1", activeSender: sender } : null),
     pending,
-    sendText: async (_to, text) => {
+    sendText: sendText ?? (async (_to, text) => {
       sent.push(text);
-    },
+    }),
     ...(ledger === undefined ? {} : { ledger }),
     reminderMs: () => reminderMs,
     wasStoppedRecently: () => stopped,
@@ -336,12 +337,14 @@ const stagesOf = (ledger) => ledger.recent(80).filter((entry) => entry.command =
   check("answering still works without a bridge", stagesOf(ledger).includes("answered"), JSON.stringify(stagesOf(ledger)));
 }
 
-// No bridge AND no bound account: there is nobody to ask. Fail closed, but say why.
+// No bridge AND no bound account: there is nobody on WeChat to ask. Say why in
+// the ledger and let the desktop ask — since the relay is prepended, answering
+// "unavailable" here would deny the tool without asking anyone anywhere.
 {
   const ledger = new CommandLedger({ dir: LEDGER_DIR });
   const { sent, relay } = harness({ timeoutMs: 2_000, ledger, bridge: false });
   const outcome = await relay.answer(request(new AbortController().signal), async () => "allowed-once");
-  equal("no recipient fails closed", outcome, "unavailable");
+  equal("no recipient leaves the question to the next answerer", outcome, "allowed-once");
   check("and nothing is sent", sent.length === 0, sent.join(" | "));
   check("the no-sender branch is recorded", stagesOf(ledger).includes("no-sender"), JSON.stringify(stagesOf(ledger)));
 }
@@ -377,6 +380,175 @@ const stagesOf = (ledger) => ledger.recent(80).filter((entry) => entry.command =
   const report = await relay.selfCheck();
   check("a self-check without a recipient is red", report.includes("审批会留在桌面") || report.includes("没有（既没有"), report);
   check("and sends nothing", sent.length === 0, sent.join(" | "));
+}
+
+// ------------------------------------------------ 2026-11-08: the miss that left no line
+
+// A fake cordis context with just enough of `on` + `_hooks` for the mount checks.
+function fakeCtx({ honorPrepend = true } = {}) {
+  const hooks = [];
+  return {
+    hooks,
+    events: { _hooks: { "approval/request": hooks } },
+    on(_name, callback, options) {
+      const hook = { callback };
+      if (options?.prepend === true && honorPrepend) hooks.unshift(hook);
+      else hooks.push(hook);
+      return () => {
+        const index = hooks.indexOf(hook);
+        if (index < 0) return false;
+        hooks.splice(index, 1);
+        return true;
+      };
+    },
+  };
+}
+// Run the real waterfall shape: outermost first, `next()` continues, a value ends it.
+function dispatchWaterfall(hooks, request) {
+  let index = 0;
+  const next = () => {
+    const hook = hooks[index];
+    index += 1;
+    return hook === undefined ? Promise.resolve("unavailable") : Promise.resolve(hook.callback(request, next));
+  };
+  return next();
+}
+
+// The desktop's forwarded listener is registered by an earlier bundle. Ours must
+// sit IN FRONT of it, or the desktop answers and the phone never hears about it.
+{
+  const ctx = fakeCtx();
+  const desktop = [];
+  ctx.hooks.push({ callback: () => { desktop.push("answered"); return "rejected"; } });
+  const { relay } = harness({ timeoutMs: 5_000 });
+  relay.register(ctx);
+  const status = relay.mountStatus();
+  check("mount: the listener is prepended ahead of the desktop's answerer",
+    status.mounted && status.position === 0 && status.total === 2, JSON.stringify(status));
+
+  // A foreign agent still goes to the desktop: prepending must not swallow it.
+  const order = [];
+  const desktopHook = ctx.hooks[1];
+  ctx.hooks[1] = { callback: (req, next) => { order.push("desktop"); return desktopHook.callback(req, next); } };
+  const foreign = { agent: { id: "someone-else" }, toolName: "bash", reason: "别人的会话", signal: new AbortController().signal };
+  const outcome = await dispatchWaterfall(ctx.hooks, foreign);
+  equal("mount: a foreign approval still reaches the desktop", outcome, "rejected");
+  check("mount: and the relay saw it first, then delegated", order.length === 1, JSON.stringify(order));
+
+  // The host can drop listeners on a reload; verifyMount re-attaches once.
+  ctx.hooks.splice(0, 1);
+  check("mount: a dropped listener is visible", relay.mountStatus().mounted === false);
+  const healed = relay.verifyMount();
+  check("mount: verifyMount re-attaches", healed.mounted && healed.position === 0, JSON.stringify(healed));
+}
+
+// The 2026-11-08 shape, kept as a regression: with the desktop's forwarded
+// answerer registered first, it answers and the relay never runs — no card, no
+// ledger line. That is exactly what the ledger showed (nothing after 01:27).
+{
+  const ledger = new CommandLedger({ dir: LEDGER_DIR });
+  const ctx = fakeCtx({ honorPrepend: false });
+  ctx.hooks.push({ callback: () => "rejected" });
+  const { relay, sent } = harness({ timeoutMs: 5_000, ledger });
+  relay.register(ctx);
+  const status = relay.mountStatus();
+  const before = ledger.recent(500).length;
+  const outcome = await dispatchWaterfall(ctx.hooks, request(new AbortController().signal));
+  const wrote = ledger.recent(500).length - before;
+  check("incident: behind the desktop's answerer the relay never runs",
+    outcome === "rejected" && status.position === 1 && sent.length === 0 && wrote === 0,
+    JSON.stringify({ outcome, status, sent, wrote }));
+}
+
+// A card that cannot leave: retry once, then record the reason and let the
+// desktop ask instead of failing closed in silence.
+{
+  const ledger = new CommandLedger({ dir: LEDGER_DIR });
+  let attempts = 0;
+  const sent = [];
+  const { pending, relay } = harness({
+    timeoutMs: 5_000,
+    ledger,
+    sendText: async (_to, text) => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("rate limited");
+      sent.push(text);
+    },
+  });
+  const outcome = relay.answer(request(new AbortController().signal), async () => "allowed-once");
+  await sleep(400);
+  check("retry: one failed send is retried and the card still arrives",
+    sent.some((text) => text.includes("DSH 权限请求")), sent.join(" | "));
+  check("retry: a retried success is not recorded as a failure",
+    !stagesOf(ledger).includes("send-failed"), JSON.stringify(stagesOf(ledger)));
+  pending.popFor("wxid_me")?.resolve("同意");
+  await outcome;
+}
+
+{
+  const ledger = new CommandLedger({ dir: LEDGER_DIR });
+  let attempts = 0;
+  const { relay } = harness({
+    timeoutMs: 5_000,
+    ledger,
+    sendText: async () => { attempts += 1; throw new Error("sendMessage ret=-2"); },
+  });
+  const outcome = await relay.answer(request(new AbortController().signal), async () => "allowed-once");
+  check("retry: a card that fails twice delegates instead of failing silently", outcome === "allowed-once");
+  check("retry: it is tried exactly twice", attempts >= 2, String(attempts));
+  const failure = ledger.recent(80).filter((entry) => entry.args?.stage === "send-failed").at(-1);
+  check("retry: the reason is in the ledger", String(failure?.summary).includes("ret=-2"), String(failure?.summary));
+}
+
+// #审批自检 reports the listener's mount state and how old the last request is.
+{
+  const ctx = fakeCtx();
+  const { relay } = harness({ timeoutMs: 5_000, owner: "wxid_owner", sender: "wxid_owner" });
+  relay.register(ctx);
+  const young = await relay.selfCheck();
+  check("self-check: says the listener is mounted and prepended",
+    young.includes("监听：已挂载") && young.includes("prepend"), young);
+  check("self-check: says no approval has arrived yet", young.includes("本次启动以来没有"), young);
+  await relay.answer({ agent: { id: "someone-else" }, toolName: "bash", signal: new AbortController().signal }, async () => "unavailable");
+  const aged = await relay.selfCheck();
+  check("self-check: reports how long ago the last approval/request was",
+    /最近一次 approval\/request：(刚刚|\d+ 秒前)/.test(aged), aged);
+}
+
+// The silent guard belongs to the bridge, so it works with no relay at all
+// (2026-11-08: the phone heard nothing for fifteen minutes).
+{
+  const { DEFAULT_CONFIG } = await import(join(ROOT, "lib/config.js"));
+  const { WechatBridge } = await import(join(ROOT, "lib/bridge.js"));
+  const sent = [];
+  const config = { ...DEFAULT_CONFIG, sessionId: "guard-session", approvalGuardMs: 30, autoMemory: false, idleCompaction: false };
+  const deps = {
+    getAccount: () => ({ configured: true, userId: "owner@wechat" }),
+    getContextToken: () => "",
+    pending: new PendingRegistry(),
+  };
+  const bridge = new WechatBridge(
+    { agents: { get: () => ({ status: "running" }) }, get: () => undefined },
+    config,
+    async (_to, text) => { sent.push(text); },
+    deps,
+  );
+  const event = (type, data = {}) => bridge.onSessionEvent({ id: "guard-session" }, { type, data, seq: 1, time: Date.now() });
+  event("turn/start", { turn: 1 });
+  await sleep(90);
+  check("guard: a silent running turn nudges the phone with no relay mounted",
+    sent.some((text) => text.includes("卡在权限或长任务")), sent.join(" | "));
+  check("guard: the nudge names the commands",
+    sent.some((text) => text.includes("#允许") && text.includes("#拒绝") && text.includes("#停一下")), sent.join(" | "));
+  event("step/start", { step: 2 });
+  await sleep(90);
+  check("guard: one nudge per turn", sent.filter((text) => text.includes("卡在权限")).length === 1, sent.join(" | "));
+  event("turn/end", { reason: { kind: "stop" } });
+  event("turn/start", { turn: 2 });
+  await sleep(90);
+  check("guard: a new turn gets its own nudge",
+    sent.filter((text) => text.includes("卡在权限")).length === 2, sent.join(" | "));
+  await bridge.dispose();
 }
 
 clearInterval(keepAlive);
