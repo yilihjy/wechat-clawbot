@@ -667,7 +667,8 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
     // an approval that belongs to the phone must reach the phone anyway.
     getOwnerId: () => currentAccount?.userId,
   });
-  relay.register(ctx);
+  // Mount and prove it: a listener that never ran is invisible otherwise (2026-11-08).
+  relay.start(ctx);
 
   // Optionally keep AGENTS.md / CLAUDE.md out of the WeChat session (config
   // workspaceInstructions; read per step, so the switch is live).

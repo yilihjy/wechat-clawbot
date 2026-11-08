@@ -238,6 +238,10 @@ export class WechatBridge {
   private readonly unansweredReminders = new Map<string, { prompts: string[]; due?: string }>();
   /** Stops listening for the host taking reminders out of the inbox. */
   private offInboxClaimed: (() => void) | undefined;
+  /** Silent-guard timer: a running turn with no event for `approvalGuardMs` gets one nudge. */
+  private guardTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Whether this turn already got its silent-guard nudge (one per turn). */
+  private guardNotified = false;
 
   constructor(ctx: Context, config: ClawbotConfig, sendText: SendTextFn, deps: BridgeDeps) {
     this.ctx = ctx;
@@ -1642,6 +1646,13 @@ export class WechatBridge {
   onSessionEvent(session: Session, event: SessionEvent): void {
     if (session.id !== this.sessionId) return;
     logger.debug(`sessionEvent: type=${event.type} seq=${event.seq}`);
+    // Silent guard (2026-11-08): a turn that stops producing events — waiting on
+    // an approval nobody delivered, or on a long tool — must not leave the phone
+    // staring at 正在输入. This runs on the session feed, so it does not depend
+    // on the approval relay having been mounted at all.
+    if (event.type === "turn/start") this.guardNotified = false;
+    if (event.type === "turn/end") this.clearApprovalGuard();
+    else this.armApprovalGuard();
     // >>> local
     // `model/selection` is declared by the agent package, not by the session's
     // own event union, so compare as a plain string.
@@ -2033,10 +2044,46 @@ export class WechatBridge {
     }
   }
 
+  /**
+   * (Re)arm the silent guard after one event of this session.
+   *
+   * Every event pushes the deadline out; when the deadline passes during a
+   * running turn the bridge sends one line to the owner. `approvalGuardMs: 0`
+   * turns it off, and a turn is nudged at most once.
+   */
+  private armApprovalGuard(): void {
+    this.clearApprovalGuard();
+    const ms = this.config.approvalGuardMs;
+    if (this.disposed || ms <= 0 || this.guardNotified) return;
+    this.guardTimer = setTimeout(() => {
+      this.guardTimer = undefined;
+      if (this.disposed || this.guardNotified) return;
+      if (this.ctx.agents.get(this.sessionId)?.status !== "running") return;
+      const owner = this.deps.getAccount()?.userId;
+      if (owner === undefined) return;
+      this.guardNotified = true;
+      logger.info(`approval-guard: 会话安静了 ${ms} ms（在跑的一轮没有事件），提醒手机一次`);
+      this.sendTextTo(
+        owner,
+        "这轮卡在权限或长任务上，回 #允许 / #拒绝 或 #停一下",
+        { uncapped: true, transient: true },
+      );
+    }, ms);
+    this.guardTimer.unref?.();
+  }
+
+  /** Stop the silent guard (turn ended, bridge disposed). */
+  private clearApprovalGuard(): void {
+    if (this.guardTimer === undefined) return;
+    clearTimeout(this.guardTimer);
+    this.guardTimer = undefined;
+  }
+
   /** Tear down the owned agent handle (the persisted session log survives). */
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
+    this.clearApprovalGuard();
     this.offInboxClaimed?.();
     this.typing.dispose();
     this.idleCompact.dispose();

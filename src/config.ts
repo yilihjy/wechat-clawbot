@@ -264,6 +264,16 @@ export interface ClawbotConfig {
   approvalReminderMs: number;
 
   /**
+   * How long (ms) a running turn may go without any event before the bridge
+   * itself nudges the phone (the silent guard, 2026-11-08).
+   *
+   * Deliberately independent of the approval relay: the 2026-11-08 incident was
+   * a turn waiting on an approval whose card never reached WeChat, and the phone
+   * heard nothing at all. 60 seconds by default; `0` disables.
+   */
+  approvalGuardMs: number;
+
+  /**
    * Directories `#新会话 <路径>` may create a session in (D50). `~` is expanded.
    *
    * Empty means "no path form at all". The workspace list (`#工作区`) is not
@@ -354,6 +364,7 @@ export const DEFAULT_CONFIG: ClawbotConfig = {
   browserCapture: browserCaptureFromEnv(process.env.WORKBENCH_BROWSER_CAPTURE),
   ackAfterMs: 4_000,
   approvalReminderMs: 3 * 60_000,
+  approvalGuardMs: 60_000,
   workspaceRoots: ["~/workspace"],
 };
 
@@ -389,6 +400,10 @@ export function normalizeConfig(raw?: Partial<ClawbotConfig> | Record<string, un
       typeof r.approvalReminderMs === "number" && Number.isFinite(r.approvalReminderMs)
         ? Math.max(0, r.approvalReminderMs)
         : DEFAULT_CONFIG.approvalReminderMs,
+    approvalGuardMs:
+      typeof r.approvalGuardMs === "number" && Number.isFinite(r.approvalGuardMs)
+        ? Math.max(0, r.approvalGuardMs)
+        : DEFAULT_CONFIG.approvalGuardMs,
     workspaceRoots:
       Array.isArray(r.workspaceRoots) ? asStringArray(r.workspaceRoots) : DEFAULT_CONFIG.workspaceRoots,
     botAgent:
@@ -628,6 +643,10 @@ export const BaseConfig = Schema.object({
     .default(3 * 60_000)
     .min(0)
     .description("微信侧审批卡片多久没人答就补一条提醒(毫秒)。0 = 不提醒;超时仍按 approvalTimeoutMs 处理"),
+  approvalGuardMs: Schema.number()
+    .default(60_000)
+    .min(0)
+    .description("一轮在跑却超过这么久没有任何事件时，桥主动在微信提醒一次(毫秒)。0 = 关闭;不依赖审批中继是否挂上"),
   workspaceRoots: Schema.array(Schema.string())
     .default(["~/workspace"])
     .description("「#新会话 <路径>」允许建会话的目录(支持 ~)。留空 = 不允许用路径形式"),
@@ -714,6 +733,7 @@ export const HOT_FIELDS = new Set<keyof ClawbotConfig>([
   "approvalTimeoutMs",
   "ackAfterMs",
   "approvalReminderMs",
+  "approvalGuardMs",
   "workspaceRoots",
   "logLevel",
   // Read fresh on each send, so changing it takes effect on the next message.

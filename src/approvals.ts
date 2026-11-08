@@ -98,6 +98,18 @@ export class ApprovalRelay {
   private readonly wasStoppedRecently: ((sessionId: string) => boolean) | undefined;
   private readonly reminderMs: () => number;
   private readonly getOwnerId: (() => string | undefined) | undefined;
+  /** The listener we registered, kept so the mount can be verified and re-attached. */
+  private handler: ((req: ApprovalRequest, next: () => Promise<ApprovalOutcome>) => Promise<ApprovalOutcome>) | undefined;
+  /** The context the listener belongs to; mount introspection reads its event hooks. */
+  private registeredCtx: Context | undefined;
+  /** Disposer of the current listener registration, when the host returned one. */
+  private disposeListener: (() => boolean) | undefined;
+  /** Whether the last attach() call went through. */
+  private mounted = false;
+  /** When the last `approval/request` reached this relay (2026-11-08 diagnosis). */
+  private lastRequestAt: number | undefined;
+  /** How many approvals this relay has seen since the plugin started. */
+  private requestsSeen = 0;
 
   constructor(deps: {
     config: ClawbotConfig;
@@ -133,17 +145,116 @@ export class ApprovalRelay {
     this.getOwnerId = deps.getOwnerId;
   }
 
-  /** Register the `approval/request` waterfall listener on the root context. */
+  /**
+   * Mount the relay and prove it landed.
+   *
+   * The 2026-11-08 incident: a turn waited on a desktop approval while WeChat
+   * heard nothing, and the ledger had no line at all — the listener never ran.
+   * So mounting is now a thing the plugin checks and writes down, not a thing
+   * it assumes.
+   *
+   * @param ctx - root context the listener belongs to.
+   */
+  start(ctx: Context): void {
+    this.registeredCtx = ctx;
+    this.handler = (req, next) => this.answer(req, next);
+    this.attach();
+    const status = this.verifyMount();
+    if (status.mounted) {
+      const where = status.position === null ? "" : `，第 ${status.position + 1}/${status.total} 位`;
+      logger.info(`approval: listener mounted (prepend${where})`);
+      this.record("ok", `审批监听已挂载（prepend${where}）`, { stage: "mount", ...status });
+      return;
+    }
+    logger.error("approval: listener is not mounted; approvals would stay on the desktop");
+    this.record("failed", "审批监听没挂上（重挂也没成功），审批只会留在桌面", { stage: "mount", ...status });
+    const to = this.getOwnerId?.() ?? this.getBridge()?.activeSender;
+    if (to !== undefined) {
+      void this.sendText(
+        to,
+        "【DSH 审批】审批监听没挂上，微信里收不到审批卡片。请重启 DSH，或在插件页把 wechat-clawbot 停用再启用。",
+      ).catch(() => {});
+    }
+  }
+
+  /**
+   * Register the `approval/request` waterfall listener.
+   *
+   * Prepended on purpose. The host forwards the same waterfall to the desktop
+   * UI, and that listener is registered by an earlier bundle: answering there
+   * ends the chain before this relay ever sees the request. A phone-owned
+   * session must ask the phone first — this is the plugin's own D53 rule — so
+   * the relay sits in front and delegates with `next()` for everything it does
+   * not own.
+   *
+   * @param ctx - root context the listener belongs to.
+   */
   register(ctx: Context): void {
-    ctx.on("approval/request", (req: ApprovalRequest, next: () => Promise<ApprovalOutcome>) =>
-      this.answer(req, next),
-    );
+    this.registeredCtx = ctx;
+    this.handler ??= (req, next) => this.answer(req, next);
+    this.attach();
+  }
+
+  /** Add the listener to the context, replacing a stale registration. */
+  private attach(): void {
+    const ctx = this.registeredCtx;
+    const handler = this.handler;
+    if (ctx === undefined || handler === undefined) return;
+    try {
+      const dispose = ctx.on("approval/request", handler, { prepend: true });
+      this.disposeListener = typeof dispose === "function" ? dispose as () => boolean : undefined;
+      this.mounted = true;
+    } catch (err) {
+      this.mounted = false;
+      logger.error(`approval: could not register the listener: ${String(err)}`);
+    }
+  }
+
+  /** Drop the current registration, if the host gave us a disposer. */
+  private detach(): void {
+    try {
+      this.disposeListener?.();
+    } catch {
+      // A disposer that throws has nothing left to remove.
+    }
+    this.disposeListener = undefined;
+    this.mounted = false;
+  }
+
+  /**
+   * Read where this relay's listener sits in the host's waterfall.
+   *
+   * `_hooks` is cordis's private registry; when a host version no longer has
+   * it, the attach bookkeeping is all that can be reported and `introspected`
+   * says so.
+   */
+  mountStatus(): { mounted: boolean; introspected: boolean; position: number | null; total: number } {
+    const hooks = (this.registeredCtx as unknown as {
+      events?: { _hooks?: Record<string, Array<{ callback?: unknown }>> };
+    } | undefined)?.events?._hooks?.["approval/request"];
+    if (!Array.isArray(hooks)) {
+      return { mounted: this.mounted, introspected: false, position: null, total: 0 };
+    }
+    const index = hooks.findIndex((hook) => hook.callback === this.handler);
+    return { mounted: index >= 0, introspected: true, position: index >= 0 ? index : null, total: hooks.length };
+  }
+
+  /** Re-attach once when the listener is gone, then report the state. */
+  verifyMount(): { mounted: boolean; introspected: boolean; position: number | null; total: number } {
+    let status = this.mountStatus();
+    if (status.mounted) return status;
+    this.detach();
+    this.attach();
+    status = this.mountStatus();
+    return status;
   }
 
   private async answer(
     req: ApprovalRequest,
     next: () => Promise<ApprovalOutcome>,
   ): Promise<ApprovalOutcome> {
+    this.lastRequestAt = Date.now();
+    this.requestsSeen += 1;
     // Routing must not depend on the bridge object (D53). `#审批自检` and the
     // 2026-11-04 incident both come down to the same thing: the bridge is a
     // *mount*, and between mounts `getBridge()` is null while a tool call is
@@ -181,16 +292,17 @@ export class ApprovalRelay {
       return next();
     }
     if (route.kind === "no-sender") {
-      // No active sender AND no bound account: there is nobody to ask. Failing
-      // closed is deliberate (a phone-owned agent must not pop a desktop
-      // dialog), but it is now written down with the reason.
-      this.record("failed", `没接：${diag.agent} 的审批找不到收件人（没有 activeSender，也没有绑定账号）`, {
+      // No active sender AND no bound account: there is nobody on WeChat to ask.
+      // Record why, then hand the request on — since 2026-11-08 this listener is
+      // prepended, so swallowing it here would deny the tool without asking
+      // anyone anywhere; the desktop can still show its card.
+      this.record("failed", `没接：${diag.agent} 的审批找不到收件人（没有 activeSender，也没有绑定账号）→ 交给桌面`, {
         ...diag,
         stage: "no-sender",
         tool: req.toolName,
       });
-      logger.warn(`approval: no recipient for agent ${agentId}; failing closed`);
-      return "unavailable";
+      logger.warn(`approval: no recipient for agent ${agentId}; leaving it to the next answerer`);
+      return next();
     }
     const sender = route.sender;
     const heading = route.kind === "relay"
@@ -206,20 +318,27 @@ export class ApprovalRelay {
 
     const routeKind = route.kind === "relay" ? "relay" : "wechat";
     const who = route.kind === "relay" ? `《${route.title.trim() || "接管中的会话"}》` : "微信会话";
-    try {
-      await this.sendText(sender, question);
-      // Answering a prompt keeps the relay window open: the owner is on the phone.
-      if (route.kind === "relay") this.modes?.touch(sender);
-    } catch (err) {
-      logger.error(`approval: failed to send question to ${sender}: ${String(err)}`);
-      this.record("failed", `没能把审批发到微信：${String(err).slice(0, 80)}`, {
+    const sendFailure = await this.sendCard(sender, question);
+    if (sendFailure !== null) {
+      // 2026-11-08: a card that never left used to fail closed in silence — the
+      // phone had no idea a turn was waiting. Retry once (inside sendCard), put
+      // the reason in the ledger, try one short line on WeChat, and let the next
+      // answerer (the desktop) ask instead of swallowing the request.
+      logger.error(`approval: failed to send question to ${sender}: ${sendFailure}`);
+      this.record("failed", `没能把审批发到微信（重试一次也没成功）：${sendFailure}`, {
         ...diag,
         tool: req.toolName,
         route: routeKind,
-        stage: "send",
+        stage: "send-failed",
       });
-      return "unavailable";
+      void this.sendText(
+        sender,
+        `有审批请求没发到手机（${sendFailure.slice(0, 40)}），这一轮交给电脑上处理。`,
+      ).catch(() => {});
+      return next();
     }
+    // Answering a prompt keeps the relay window open: the owner is on the phone.
+    if (route.kind === "relay") this.modes?.touch(sender);
     // D49: the card is one text message in a chat stream; record that it went
     // out, so "did I get a card?" stops being a question nobody can answer.
     this.record("ok", `发出审批（${who}）：${req.toolName}${diag.bridgeMounted ? "" : "（监听未挂载，按会话兜底发出）"}`, {
@@ -337,6 +456,32 @@ export class ApprovalRelay {
   }
 
   /**
+   * Send one approval message, retrying once.
+   *
+   * WeChat refusals are usually transient (rate limit, a hiccup on the CDN), so
+   * one retry turns most of them into a delivered card. The caller records the
+   * final failure, because a card nobody saw must not look like one that was
+   * answered.
+   *
+   * @param sender - WeChat recipient.
+   * @param text - the card body.
+   * @returns null when it went out, otherwise the failure text.
+   */
+  private async sendCard(sender: string, text: string): Promise<string | null> {
+    let last: unknown;
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      try {
+        await this.sendText(sender, text);
+        return null;
+      } catch (err) {
+        last = err;
+        if (attempt === 1) await new Promise((resolve) => setTimeout(resolve, 300));
+      }
+    }
+    return String((last as { message?: unknown } | undefined)?.message ?? last).slice(0, 120);
+  }
+
+  /**
    * `#审批自检` — prove this chain end to end, on the spot (D53).
    *
    * Answers the three questions a silent miss raises: is the listener mounted,
@@ -358,9 +503,21 @@ export class ApprovalRelay {
     const recipient = route.kind === "wechat" || route.kind === "relay"
       ? route.sender
       : "没有（既没有 activeSender，也没有绑定账号）";
+    // The two questions the 2026-11-08 miss could not answer: is the waterfall
+    // listener still in the chain, and when did an approval last reach it?
+    const mount = this.verifyMount();
+    const ageMs = this.lastRequestAt === undefined ? null : Date.now() - this.lastRequestAt;
+    const mountText = mount.mounted
+      ? `已挂载（prepend${mount.position === null ? "" : `，第 ${mount.position + 1}/${mount.total} 位`}）`
+      : "没挂上（重挂也没成功，审批只会留在桌面）";
+    const ageText = ageMs === null
+      ? "本次启动以来没有"
+      : `${ageMs < 1000 ? "刚刚" : `${Math.round(ageMs / 1000)} 秒前`}（共 ${this.requestsSeen} 次）`;
     const lines = [
       "【审批自检】",
-      `监听：${bridge === null ? "未挂载（现在这条链路靠会话 id + 绑定账号兜底）" : "已挂载"}`,
+      `监听：${mountText}`,
+      `最近一次 approval/request：${ageText}`,
+      `桥接：${bridge === null ? "未挂载（按会话 id + 绑定账号兜底）" : "已挂载"}`,
       `微信会话：${this.config.sessionId.slice(-8)}`,
       `收件人：${recipient}`,
       `路由结论：${route.kind === "wechat" ? "审批会发到手机" : "审批会留在桌面"}`,
