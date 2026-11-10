@@ -537,17 +537,54 @@ function dispatchWaterfall(hooks, request) {
   event("turn/start", { turn: 1 });
   await sleep(90);
   check("guard: a silent running turn nudges the phone with no relay mounted",
-    sent.some((text) => text.includes("卡在权限或长任务")), sent.join(" | "));
-  check("guard: the nudge names the commands",
-    sent.some((text) => text.includes("#允许") && text.includes("#拒绝") && text.includes("#停一下")), sent.join(" | "));
+    sent.some((text) => text.includes("这轮还在跑")), sent.join(" | "));
+  // 2026-11-10: with no approval waiting the nudge must not offer #允许 / #拒绝 —
+  // answering one of those got "现在没有待批的权限请求".
+  check("guard: a long task names #停一下 only",
+    sent.some((text) => text.includes("长任务") && text.includes("#停一下") && !text.includes("#允许")),
+    sent.join(" | "));
   event("step/start", { step: 2 });
   await sleep(90);
-  check("guard: one nudge per turn", sent.filter((text) => text.includes("卡在权限")).length === 1, sent.join(" | "));
+  check("guard: one nudge per turn", sent.filter((text) => text.includes("还在跑")).length === 1, sent.join(" | "));
   event("turn/end", { reason: { kind: "stop" } });
   event("turn/start", { turn: 2 });
   await sleep(90);
   check("guard: a new turn gets its own nudge",
-    sent.filter((text) => text.includes("卡在权限")).length === 2, sent.join(" | "));
+    sent.filter((text) => text.includes("还在跑")).length === 2, sent.join(" | "));
+  await bridge.dispose();
+}
+
+// With an approval actually waiting, the nudge names #允许 / #拒绝 and that
+// answer reaches the same pending entry the command path pops.
+{
+  const { DEFAULT_CONFIG } = await import(join(ROOT, "lib/config.js"));
+  const { WechatBridge } = await import(join(ROOT, "lib/bridge.js"));
+  const sent = [];
+  const pending = new PendingRegistry();
+  const config = { ...DEFAULT_CONFIG, sessionId: "guard-pending", approvalGuardMs: 30, autoMemory: false, idleCompaction: false };
+  const deps = {
+    getAccount: () => ({ configured: true, userId: "owner@wechat" }),
+    getContextToken: () => "",
+    pending,
+  };
+  const bridge = new WechatBridge(
+    { agents: { get: () => ({ status: "running" }) }, get: () => undefined },
+    config,
+    async (_to, text) => { sent.push(text); },
+    deps,
+  );
+  let answered = null;
+  pending.push({ tag: "approval", sender: "owner@wechat", resolve: (reply) => { answered = reply; } });
+  bridge.onSessionEvent({ id: "guard-pending" }, { type: "turn/start", data: { turn: 1 }, seq: 1, time: Date.now() });
+  await sleep(90);
+  check("guard: a waiting approval is named as such",
+    sent.some((text) => text.includes("有权限请求在等你") && text.includes("#允许") && text.includes("#拒绝")),
+    sent.join(" | "));
+  check("guard: and it does not talk about long tasks",
+    !sent.some((text) => text.includes("长任务")), sent.join(" | "));
+  // #允许 goes through InboundRouter.answerApproval: popFor + resolve("同意").
+  pending.popFor("owner@wechat")?.resolve("同意");
+  check("guard: the #允许 path still resolves the pending approval", answered === "同意", String(answered));
   await bridge.dispose();
 }
 

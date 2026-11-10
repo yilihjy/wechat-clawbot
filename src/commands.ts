@@ -587,7 +587,21 @@ function answerApproval(deps: CommandDeps, decision: "yes" | "no"): string {
     return "现在等的是提问，不是权限请求 —— 直接回复内容就行。";
   }
   record(deps, { command: name, result: "noop", summary: "没有待批的权限请求" });
-  return "现在没有待批的权限请求。";
+  // A bare "nothing pending" leaves the owner guessing whether the bot is alive.
+  // If a turn is still running, say so and name the one command that helps.
+  const running = (() => {
+    try {
+      const agents = (deps.ctx as unknown as {
+        agents?: { get?: (id: string) => { status?: string } | undefined };
+      }).agents;
+      return agents?.get?.(deps.sessionId)?.status === "running";
+    } catch {
+      return false;
+    }
+  })();
+  return running
+    ? "现在没有待批，这一轮还在跑；要打断回 #停一下。"
+    : "现在没有待批的权限请求。";
 }
 
 /** `#任务状态` / `#任务状态 N`. */

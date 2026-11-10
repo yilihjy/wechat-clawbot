@@ -49,6 +49,17 @@ export class PendingRegistry {
     return this.queue.some((a) => a.sender === sender);
   }
 
+  /**
+   * Whether a pending interaction of one kind waits for this sender.
+   *
+   * The silent guard asks this before it names #允许 / #拒绝: offering those
+   * commands during a long task that has no approval waiting sends the owner
+   * chasing a permission request that does not exist (2026-11-10).
+   */
+  hasTagFor(tag: string, sender: string): boolean {
+    return this.queue.some((a) => a.sender === sender && a.tag === tag);
+  }
+
   /** How many interactions are waiting for an answer from anyone. */
   get size(): number {
     return this.queue.length;

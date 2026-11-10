@@ -1860,7 +1860,7 @@ function check(name, ok, detail) {
   const setup = (agentOpts, { sendText = async () => {}, backlog } = {}) => {
     const config = { ...DEFAULT_CONFIG, sessionId: "sim-wechat", autoMemory: false, idleCompaction: false };
     let agent;
-    const deps = { getAccount: () => null, getContextToken: () => "", pending: { hasFor: () => false, size: 0, popFor: () => undefined }, backlog };
+    const deps = { getAccount: () => null, getContextToken: () => "", pending: { hasFor: () => false, hasTagFor: () => false, size: 0, popFor: () => undefined }, backlog };
     const bridge = new WechatBridge({ agents: { get: () => agent } }, config, sendText, deps);
     agent = new HostLikeAgent(bridge, "sim-wechat", agentOpts);
     bridge.ensureAgent = async () => agent;
@@ -2203,7 +2203,7 @@ function check(name, ok, detail) {
     const injected = [];
     const agent = { inbox: { nextStep: [], nextTurn: [] }, inject: (m) => injected.push(m), status: "idle" };
     const config = { ...DEFAULT_CONFIG, sessionId: "sim-wechat", autoMemory: false, idleCompaction: false };
-    const deps = { getAccount: () => null, getContextToken: () => "", pending: { hasFor: () => false, size: 0, popFor: () => undefined }, backlog, sendFile };
+    const deps = { getAccount: () => null, getContextToken: () => "", pending: { hasFor: () => false, hasTagFor: () => false, size: 0, popFor: () => undefined }, backlog, sendFile };
     const bridge = new WechatBridge({ agents: { get: () => agent } }, config, sendText, deps);
     return { bridge, backlog, injected };
   };

@@ -328,6 +328,16 @@ check("#允许 stays silent (the approval path says 已批准)", answered === ""
 const refused = await run("#拒绝", { approve: () => "answered" });
 check("#拒绝 stays silent too", refused === "");
 check("#允许 with nothing pending says so", (await run("#允许", { approve: () => "none" })).includes("没有待批的权限请求"));
+// 2026-11-10: nothing pending, but a turn is still running — say that, and name
+// the one command that helps, instead of a bare "nothing pending".
+{
+  const runningCtx = { ...fakeCtx, agents: { list: () => [], get: () => ({ status: "running" }) } };
+  const reply = await run("#允许", { ctx: runningCtx, approve: () => "none" });
+  check("#允许 with nothing pending but a running turn says the turn is still running",
+    reply.includes("这一轮还在跑") && reply.includes("#停一下"), reply);
+  check("and it does not pretend a permission request exists",
+    !reply.includes("没有待批的权限请求"), reply);
+}
 check("#允许 while a question waits does not answer it", (await run("#允许", { approve: () => "question" })).includes("不是权限请求"));
 
 // A mirror the relay still owes must not survive the binding it belonged to

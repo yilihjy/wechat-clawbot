@@ -2062,10 +2062,18 @@ export class WechatBridge {
       const owner = this.deps.getAccount()?.userId;
       if (owner === undefined) return;
       this.guardNotified = true;
-      logger.info(`approval-guard: 会话安静了 ${ms} ms（在跑的一轮没有事件），提醒手机一次`);
+      // Name only what is actually true: a waiting approval gets #允许 / #拒绝,
+      // a long task gets #停一下. Mixing them sent the owner answering a
+      // permission request that did not exist (2026-11-10).
+      const waiting = this.deps.pending.hasTagFor("approval", owner);
+      logger.info(
+        `approval-guard: 会话安静了 ${ms} ms（在跑的一轮没有事件，${waiting ? "有审批在等" : "是长任务"}），提醒手机一次`,
+      );
       this.sendTextTo(
         owner,
-        "这轮卡在权限或长任务上，回 #允许 / #拒绝 或 #停一下",
+        waiting
+          ? "有权限请求在等你，回 #允许 / #拒绝"
+          : "这轮还在跑（长任务），要打断回 #停一下",
         { uncapped: true, transient: true },
       );
     }, ms);
