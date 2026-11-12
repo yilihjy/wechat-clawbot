@@ -391,7 +391,14 @@ function fakeCtx({ honorPrepend = true } = {}) {
     hooks,
     events: { _hooks: { "approval/request": hooks } },
     on(_name, callback, options) {
-      const hook = { callback };
+      // cordis stores a WRAPPER: `hook.callback === handler` is false on 4.0.4 and
+      // 4.1.0 alike, while the wrapper keeps the handler's `name`. The fake has to
+      // behave the same way — a harness that kept the identity tested a host that
+      // does not exist, and hid a mount proof that reported "not mounted" on a
+      // working relay.
+      const wrapped = (...args) => callback(...args);
+      Object.defineProperty(wrapped, "name", { value: callback.name });
+      const hook = { callback: wrapped };
       if (options?.prepend === true && honorPrepend) hooks.unshift(hook);
       else hooks.push(hook);
       return () => {
@@ -440,6 +447,34 @@ function dispatchWaterfall(hooks, request) {
   check("mount: a dropped listener is visible", relay.mountStatus().mounted === false);
   const healed = relay.verifyMount();
   check("mount: verifyMount re-attaches", healed.mounted && healed.position === 0, JSON.stringify(healed));
+}
+
+// The proof has to be the count, because the identity is a wrapper. A host that
+// accepts `on()` but stores nothing is the one case that must still be red: that
+// is the 2026-11-08 shape (a listener nobody can find), and it must not heal
+// into a green line just because `on()` did not throw.
+{
+  const silent = {
+    events: { _hooks: { "approval/request": [] } },
+    on() { return () => false; },
+  };
+  const { relay } = harness({ timeoutMs: 5_000 });
+  relay.register(silent);
+  const status = relay.mountStatus();
+  check("mount: a registration that never landed is not reported as mounted",
+    status.mounted === false && status.introspected === true, JSON.stringify(status));
+  check("mount: and verifyMount cannot heal it", relay.verifyMount().mounted === false);
+}
+
+// A host without a readable hook table keeps the old bookkeeping and says it was
+// not introspected — unproven, not failed.
+{
+  const opaque = { on() { return () => true; } };
+  const { relay } = harness({ timeoutMs: 5_000 });
+  relay.register(opaque);
+  const status = relay.mountStatus();
+  check("mount: an unreadable hook table reports unproven instead of failed",
+    status.mounted === true && status.introspected === false, JSON.stringify(status));
 }
 
 // The 2026-11-08 shape, kept as a regression: with the desktop's forwarded

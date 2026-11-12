@@ -16,6 +16,9 @@ import { PendingRegistry } from "./pending.js";
 import { isFresh, type ModeStore, type RelayBinding } from "./modes.js";
 import { logger } from "./ilink/util/logger.js";
 
+/** Name cordis keeps on the stored wrapper; it is how the mount finds its own entry. */
+const APPROVAL_HANDLER_NAME = "wechatClawbotApprovalRelay";
+
 // NOTE: no \b word boundaries here — JS \b does not match CJK text, so
 // "同意" would never match a pattern like /^同意\b/.
 const YES_RE = /^(同意|允许|批准|确认|可以|好的?|是|yes|y|ok|allow|approve)$/i;
@@ -104,7 +107,7 @@ export class ApprovalRelay {
   private registeredCtx: Context | undefined;
   /** Disposer of the current listener registration, when the host returned one. */
   private disposeListener: (() => boolean) | undefined;
-  /** Whether the last attach() call went through. */
+  /** Whether the last attach() call went through (the host's own table is read live). */
   private mounted = false;
   /** When the last `approval/request` reached this relay (2026-11-08 diagnosis). */
   private lastRequestAt: number | undefined;
@@ -157,7 +160,7 @@ export class ApprovalRelay {
    */
   start(ctx: Context): void {
     this.registeredCtx = ctx;
-    this.handler = (req, next) => this.answer(req, next);
+    this.handler ??= this.makeHandler();
     this.attach();
     const status = this.verifyMount();
     if (status.mounted) {
@@ -191,11 +194,34 @@ export class ApprovalRelay {
    */
   register(ctx: Context): void {
     this.registeredCtx = ctx;
-    this.handler ??= (req, next) => this.answer(req, next);
+    this.handler ??= this.makeHandler();
     this.attach();
   }
 
-  /** Add the listener to the context, replacing a stale registration. */
+  /**
+   * Build the listener with a name cordis keeps.
+   *
+   * cordis stores a wrapper, not the function handed to `on()`, so `===` can
+   * never find this relay's own entry — that identity check reported "not
+   * mounted" on a working relay (ledger 2026-11-09 → 2026-11-10, and a fresh
+   * 0.2.2-rc.2 boot). The wrapper does keep the callback's `name` on both 4.0.4
+   * and 4.1.0, so the name is what makes the entry findable.
+   */
+  private makeHandler(): (req: ApprovalRequest, next: () => Promise<ApprovalOutcome>) => Promise<ApprovalOutcome> {
+    const handler = (req: ApprovalRequest, next: () => Promise<ApprovalOutcome>): Promise<ApprovalOutcome> =>
+      this.answer(req, next);
+    Object.defineProperty(handler, "name", { value: APPROVAL_HANDLER_NAME });
+    return handler;
+  }
+
+  /**
+   * Add the listener to the context, replacing a stale registration.
+   *
+   * `on()` throwing is not the only way a mount fails: a registration can land
+   * on a table that is disposed a moment later, and the 2026-11-08 miss was
+   * exactly a listener nobody could find. So the table is read back right after
+   * registering, and an unreadable table stays *unproven* rather than failed.
+   */
   private attach(): void {
     const ctx = this.registeredCtx;
     const handler = this.handler;
@@ -203,11 +229,33 @@ export class ApprovalRelay {
     try {
       const dispose = ctx.on("approval/request", handler, { prepend: true });
       this.disposeListener = typeof dispose === "function" ? dispose as () => boolean : undefined;
-      this.mounted = true;
+      this.mounted = typeof dispose === "function";
+      const mount = this.readMount();
+      if (mount.introspected && mount.position === null) {
+        logger.error(`approval: the listener did not land in the chain (${mount.total} hooks, none ours)`);
+      }
     } catch (err) {
       this.mounted = false;
       logger.error(`approval: could not register the listener: ${String(err)}`);
     }
+  }
+
+  /**
+   * Find this relay's own entry in the host's `approval/request` hook table.
+   *
+   * cordis stores a wrapper around the callback, so `hook.callback === handler`
+   * is false on 4.0.4 and 4.1.0 alike; the wrapper keeps the callback's `name`,
+   * which is why {@link makeHandler} names it. `introspected` is false when the
+   * host no longer exposes the table at all.
+   */
+  private readMount(): { introspected: boolean; position: number | null; total: number } {
+    const hooks = (this.registeredCtx as unknown as {
+      events?: { _hooks?: Record<string, Array<{ callback?: { name?: unknown } }>> };
+    } | undefined)?.events?._hooks?.["approval/request"];
+    if (!Array.isArray(hooks)) return { introspected: false, position: null, total: 0 };
+    const index = hooks.findIndex((hook) =>
+      hook.callback === this.handler || hook.callback?.name === APPROVAL_HANDLER_NAME);
+    return { introspected: true, position: index >= 0 ? index : null, total: hooks.length };
   }
 
   /** Drop the current registration, if the host gave us a disposer. */
@@ -224,19 +272,15 @@ export class ApprovalRelay {
   /**
    * Read where this relay's listener sits in the host's waterfall.
    *
-   * `_hooks` is cordis's private registry; when a host version no longer has
-   * it, the attach bookkeeping is all that can be reported and `introspected`
-   * says so.
+   * `_hooks` is cordis's private registry, read live through {@link readMount}:
+   * the position is this relay's real index in the chain, not a guess. When a
+   * host version has no such table, the attach bookkeeping is all that can be
+   * reported and `introspected` says so.
    */
   mountStatus(): { mounted: boolean; introspected: boolean; position: number | null; total: number } {
-    const hooks = (this.registeredCtx as unknown as {
-      events?: { _hooks?: Record<string, Array<{ callback?: unknown }>> };
-    } | undefined)?.events?._hooks?.["approval/request"];
-    if (!Array.isArray(hooks)) {
-      return { mounted: this.mounted, introspected: false, position: null, total: 0 };
-    }
-    const index = hooks.findIndex((hook) => hook.callback === this.handler);
-    return { mounted: index >= 0, introspected: true, position: index >= 0 ? index : null, total: hooks.length };
+    const mount = this.readMount();
+    if (!mount.introspected) return { mounted: this.mounted, introspected: false, position: null, total: 0 };
+    return { mounted: mount.position !== null, ...mount };
   }
 
   /** Re-attach once when the listener is gone, then report the state. */
