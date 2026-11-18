@@ -67,13 +67,14 @@
     "test:relay": "node test/relay.mjs",
     "test:monitor": "node test/monitor.mjs",
     "test:approvals": "node test/approvals.mjs",
+    "test:readonly": "node test/readonly.mjs",
     "test:ledger": "node test/ledger.mjs",
     "test:timeline": "node test/timeline.mjs",
     "test:stop": "node test/stop.mjs",
     "test:undo": "node test/undo.mjs",
     "test:ack": "node test/ack.mjs",
     "test:cdn": "node test/cdn-http.mjs",
-    "test:unit": "npm run build && node test/commands.mjs && node test/capture.mjs && node test/modes.mjs && node test/relay.mjs && node test/monitor.mjs && node test/approvals.mjs && node test/ledger.mjs && node test/stop.mjs && node test/timeline.mjs && node test/undo.mjs && node test/ack.mjs && node test/cdn-http.mjs"
+    "test:unit": "npm run build && node test/commands.mjs && node test/capture.mjs && node test/modes.mjs && node test/relay.mjs && node test/monitor.mjs && node test/approvals.mjs && node test/readonly.mjs && node test/ledger.mjs && node test/stop.mjs && node test/timeline.mjs && node test/undo.mjs && node test/ack.mjs && node test/cdn-http.mjs"
   },
   "dsh": {
     "bundle": {

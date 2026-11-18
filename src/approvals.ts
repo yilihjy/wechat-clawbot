@@ -14,6 +14,7 @@ import type { WechatBridge } from "./bridge.js";
 import type { CommandLedger } from "./ledger.js";
 import { PendingRegistry } from "./pending.js";
 import { isFresh, type ModeStore, type RelayBinding } from "./modes.js";
+import { classifyReadOnly, ruleLabel, type ReadOnlyVerdict } from "./read-only.js";
 import { logger } from "./ilink/util/logger.js";
 
 /** Name cordis keeps on the stored wrapper; it is how the mount finds its own entry. */
@@ -101,6 +102,8 @@ export class ApprovalRelay {
   private readonly wasStoppedRecently: ((sessionId: string) => boolean) | undefined;
   private readonly reminderMs: () => number;
   private readonly getOwnerId: (() => string | undefined) | undefined;
+  /** Where an approval's tool-call arguments come from (D55). */
+  private readonly lookupCommand: ((sessionId: string, callId: string) => string | undefined) | undefined;
   /** The listener we registered, kept so the mount can be verified and re-attached. */
   private handler: ((req: ApprovalRequest, next: () => Promise<ApprovalOutcome>) => Promise<ApprovalOutcome>) | undefined;
   /** The context the listener belongs to; mount introspection reads its event hooks. */
@@ -113,6 +116,12 @@ export class ApprovalRelay {
   private lastRequestAt: number | undefined;
   /** How many approvals this relay has seen since the plugin started. */
   private requestsSeen = 0;
+  /** How many approvals were answered by the read-only rule instead of a card (D55). */
+  private autoAllowed = 0;
+  /** The last auto-allowed request, for `#审批策略`. */
+  private lastAutoAllow: { summary: string; at: number } | undefined;
+  /** The last request the read-only rule declined, and why (D55 diagnostics). */
+  private lastDeclined: { tool: string; why: string; at: number } | undefined;
 
   constructor(deps: {
     config: ClawbotConfig;
@@ -136,6 +145,14 @@ export class ApprovalRelay {
      * now — the owner is the only human this deployment talks to.
      */
     getOwnerId?: () => string | undefined;
+    /**
+     * The raw `command` of the tool call an approval is about (D55).
+     *
+     * The approval event carries a `callId`, not the arguments; the read-only
+     * rule needs the command, so the plugin keeps the last few `tool/call`
+     * events and this is how they are looked up.
+     */
+    lookupCommand?: (sessionId: string, callId: string) => string | undefined;
   }) {
     this.config = deps.config;
     this.getBridge = deps.getBridge;
@@ -146,6 +163,7 @@ export class ApprovalRelay {
     this.wasStoppedRecently = deps.wasStoppedRecently;
     this.reminderMs = deps.reminderMs ?? (() => 0);
     this.getOwnerId = deps.getOwnerId;
+    this.lookupCommand = deps.lookupCommand;
   }
 
   /**
@@ -349,6 +367,14 @@ export class ApprovalRelay {
       return next();
     }
     const sender = route.sender;
+    const routeKind = route.kind === "relay" ? "relay" : "wechat";
+    const who = route.kind === "relay" ? `《${route.title.trim() || "接管中的会话"}》` : "微信会话";
+    // D55: read-only production DB / docker reads are allowed by default. The
+    // rule is proved from the command text (see src/read-only.ts), never from
+    // "it looks harmless"; anything it cannot prove still becomes a card.
+    const auto = this.autoAllow(req, routeKind, sender, diag);
+    if (auto !== null) return auto;
+
     const heading = route.kind === "relay"
       ? `【DSH 权限请求 · ${route.title.trim() === "" ? "接管中的会话" : `《${route.title}》`}】`
       : "【DSH 权限请求】";
@@ -360,8 +386,6 @@ export class ApprovalRelay {
       `请回复：#允许 / #拒绝`;
     // <<< local
 
-    const routeKind = route.kind === "relay" ? "relay" : "wechat";
-    const who = route.kind === "relay" ? `《${route.title.trim() || "接管中的会话"}》` : "微信会话";
     const sendFailure = await this.sendCard(sender, question);
     if (sendFailure !== null) {
       // 2026-11-08: a card that never left used to fail closed in silence — the
@@ -500,6 +524,106 @@ export class ApprovalRelay {
   }
 
   /**
+   * Answer a read-only production request without the phone (D55).
+   *
+   * The ledger says most cards were the same thing: `docker exec
+   * workbench-workbench-1 node -e "…DatabaseSync('/data/workbench.db',
+   * { readOnly: true })…"` and `docker ps / logs / inspect`. Answering those by
+   * hand is friction, not judgement — but "answer by itself" must mean
+   * *provably* read-only, so this only fires when {@link classifyReadOnly} can
+   * prove every segment of the command, and fails back to the card otherwise.
+   *
+   * Every grant is one-shot, written to the ledger with the command, and said
+   * out loud on WeChat: silent automation would trade friction for blindness.
+   *
+   * @param req - the approval request.
+   * @param routeKind - where it came from (both are the phone).
+   * @param sender - the WeChat recipient.
+   * @param diag - the routing diagnostics already collected.
+   * @returns the outcome to use, or null to ask the phone as before.
+   */
+  private autoAllow(
+    req: ApprovalRequest,
+    routeKind: "wechat" | "relay",
+    sender: string,
+    diag: Record<string, unknown>,
+  ): "allowed-once" | "cancelled" | null {
+    if (this.config.autoAllowReadOnly === false) return null;
+    if (req.toolName !== "bash") return null;
+    const callId = req.callId;
+    if (callId === undefined) return null;
+    const command = this.lookupCommand?.(String(req.agent.id), String(callId));
+    if (command === undefined) {
+      // The arguments are not known, so nothing is proved. This is the honest
+      // answer, and it is why the tool-call index exists at all.
+      this.lastDeclined = { tool: req.toolName, why: "拿不到这条 tool/call 的参数", at: Date.now() };
+      return null;
+    }
+    const verdict: ReadOnlyVerdict = classifyReadOnly(command, {
+      containers: this.config.prodContainers ?? [],
+      volumes: this.config.prodVolumes ?? [],
+    });
+    if (!verdict.allow || verdict.rule === undefined) {
+      this.lastDeclined = { tool: req.toolName, why: verdict.why, at: Date.now() };
+      return null;
+    }
+    this.autoAllowed += 1;
+    this.lastAutoAllow = { summary: verdict.summary ?? verdict.rule, at: Date.now() };
+    const label = ruleLabel(verdict.rule);
+    const compact = command.replace(/\s+/g, " ").trim().slice(0, 300);
+    const via = req.reason?.startsWith("Auto review denied")
+      ? "auto-review"
+      : /^escalate sandbox/i.test(req.reason ?? "")
+        ? "escalation"
+        : "direct";
+    this.record("ok", `自动放行（${label}）：${verdict.summary ?? ""}`, {
+      ...diag,
+      tool: req.toolName,
+      route: routeKind,
+      stage: "auto-allowed",
+      rule: verdict.rule,
+      via,
+      command: compact,
+      ...(verdict.targets === undefined ? {} : { targets: verdict.targets.join(",") }),
+    });
+    logger.info(`approval: auto-allowed (${verdict.rule}) ${compact.slice(0, 120)}`);
+    if (req.signal?.aborted) return "cancelled";
+    if (this.config.autoAllowNotice !== false) {
+      void this.sendText(sender, `已自动允许（${label}）：${verdict.summary ?? ""}`).catch(() => {});
+    }
+    return "allowed-once";
+  }
+
+  /**
+   * `#审批策略` — what the read-only rule would do right now (D55).
+   *
+   * The auto-allow is only trustworthy if the owner can see its boundaries
+   * without reading the source, so this prints the allowlist, what has been
+   * granted this run, and — more useful than either — the last request the rule
+   * declined and why.
+   */
+  policyText(): string {
+    const on = this.config.autoAllowReadOnly !== false;
+    const containers = this.config.prodContainers ?? [];
+    const volumes = this.config.prodVolumes ?? [];
+    const lines = [
+      "【审批策略】",
+      `只读自动放行：${on ? "开" : "关"}`,
+      `生产容器：${containers.length === 0 ? "（空）" : containers.join("、")}`,
+      `生产卷：${volumes.length === 0 ? "（空）" : volumes.join("、")}`,
+      `本次已放行：${this.autoAllowed} 次`,
+    ];
+    if (this.lastAutoAllow !== undefined) {
+      lines.push(`最近一次放行：${this.lastAutoAllow.summary}`);
+    }
+    if (this.lastDeclined !== undefined) {
+      lines.push(`最近一次没放行：${this.lastDeclined.tool} — ${this.lastDeclined.why}`);
+    }
+    lines.push("", "放行范围：docker ps/logs/inspect 一类只读子命令；白名单容器里的 node 只读贴库、只读子命令；白名单卷的 docker run --rm 且 :ro。其余照旧发卡片。");
+    return lines.join("\n");
+  }
+
+  /**
    * Send one approval message, retrying once.
    *
    * WeChat refusals are usually transient (rate limit, a hiccup on the CDN), so
@@ -565,6 +689,7 @@ export class ApprovalRelay {
       `微信会话：${this.config.sessionId.slice(-8)}`,
       `收件人：${recipient}`,
       `路由结论：${route.kind === "wechat" ? "审批会发到手机" : "审批会留在桌面"}`,
+      `只读自动放行：${this.config.autoAllowReadOnly === false ? "关" : `开（本次已放行 ${this.autoAllowed} 次）`}`,
       `超时：${this.config.approvalTimeoutMs === 0 ? "一直等" : `${Math.round(this.config.approvalTimeoutMs / 60000)} 分钟`}`,
     ];
     if (route.kind !== "wechat") {

@@ -20,6 +20,7 @@ import { ApprovalRelay } from "./approvals.js";
 import { tryRegisterQuestionProvider } from "./questions.js";
 import { runMonitor } from "./monitor.js";
 import { PendingRegistry } from "./pending.js";
+import { ToolCallIndex } from "./tool-calls.js";
 import { watchAccountStore, type StateWatcher } from "./state.js";
 import { registerWechatGuidanceGlobal } from "./prompt.js";
 import { registerSubagentModelPolicy } from "./subagent-model.js";
@@ -244,6 +245,12 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
 
   const pending = new PendingRegistry();
 
+  /**
+   * The arguments of recent tool calls (D55): an approval arrives with a
+   * `callId`, and the read-only rule needs the `command` behind it.
+   */
+  const toolCalls = new ToolCallIndex();
+
   let bridge: WechatBridge | null = null;
   // >>> local: relay（D2/D19）
   /**
@@ -342,6 +349,8 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
     // 只看被接管会话的事件：其它会话与这里无关，relay 自己按 sessionId 过滤。
     relays?.onSessionEvent(String(session.id), event as { type: string; data?: unknown });
     // <<< local
+    // D55: keep each tool call's arguments for the approval that follows it.
+    toolCalls.record(String(session.id), event as { type?: unknown; data?: unknown });
   });
 
   /** Send a text message back to one WeChat user through the bound account. */
@@ -549,6 +558,8 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
       // D53: `#审批自检` asks the approval relay the same questions a real
       // request would, and sends a real card through the same sender.
       approvalSelfCheck: () => relay.selfCheck(),
+      // D55: `#审批策略` prints what the read-only rule allows right now.
+      approvalPolicy: () => relay.policyText(),
       ...(relays === null ? {} : { relay: relays }),
     });
 
@@ -666,6 +677,8 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
     // D53: the bound owner is the fallback recipient when no turn is active —
     // an approval that belongs to the phone must reach the phone anyway.
     getOwnerId: () => currentAccount?.userId,
+    // D55: the read-only rule needs the command behind the approval's callId.
+    lookupCommand: (sessionId: string, callId: string) => toolCalls.bashCommand(sessionId, callId),
   });
   // Mount and prove it: a listener that never ran is invisible otherwise (2026-11-08).
   relay.start(ctx);

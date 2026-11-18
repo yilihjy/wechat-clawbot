@@ -274,6 +274,40 @@ export interface ClawbotConfig {
   approvalGuardMs: number;
 
   /**
+   * Answer provably read-only production requests without a card (D55).
+   *
+   * The ledger showed most approval cards were the same two things: read-only
+   * SQLite queries against the production volume, and `docker ps / logs /
+   * inspect`. When this is on, such a request is granted once, written to the
+   * ledger and announced on WeChat instead of waiting for `#允许`.
+   *
+   * "Provably" is load-bearing: `src/read-only.ts` only allows commands it can
+   * fully parse and prove (no shell escapes, every segment on the whitelist,
+   * `readOnly: true` in the SQLite snippet). Anything else still asks.
+   */
+  autoAllowReadOnly: boolean;
+
+  /**
+   * Say one line on WeChat per auto-allowed request (default on).
+   *
+   * Off makes the auto-allow silent — the ledger still records every grant, but
+   * the phone stops seeing what happened. Default on: automation without a
+   * trace is how "why did nobody ask me" becomes unanswerable.
+   */
+  autoAllowNotice: boolean;
+
+  /**
+   * Containers `docker exec` may enter for read-only work (D55).
+   *
+   * Only used by the read-only rule: the payload still has to prove itself
+   * read-only. Empty disables the container half entirely.
+   */
+  prodContainers: string[];
+
+  /** Named volumes `docker run -v …:ro` may mount (D55). */
+  prodVolumes: string[];
+
+  /**
    * Directories `#新会话 <路径>` may create a session in (D50). `~` is expanded.
    *
    * Empty means "no path form at all". The workspace list (`#工作区`) is not
@@ -365,6 +399,10 @@ export const DEFAULT_CONFIG: ClawbotConfig = {
   ackAfterMs: 4_000,
   approvalReminderMs: 3 * 60_000,
   approvalGuardMs: 60_000,
+  autoAllowReadOnly: true,
+  autoAllowNotice: true,
+  prodContainers: ["workbench-workbench-1"],
+  prodVolumes: ["workbench_workbench-data"],
   workspaceRoots: ["~/workspace"],
 };
 
@@ -404,6 +442,20 @@ export function normalizeConfig(raw?: Partial<ClawbotConfig> | Record<string, un
       typeof r.approvalGuardMs === "number" && Number.isFinite(r.approvalGuardMs)
         ? Math.max(0, r.approvalGuardMs)
         : DEFAULT_CONFIG.approvalGuardMs,
+    autoAllowReadOnly:
+      typeof r.autoAllowReadOnly === "boolean"
+        ? r.autoAllowReadOnly
+        : DEFAULT_CONFIG.autoAllowReadOnly,
+    autoAllowNotice:
+      typeof r.autoAllowNotice === "boolean"
+        ? r.autoAllowNotice
+        : DEFAULT_CONFIG.autoAllowNotice,
+    prodContainers:
+      Array.isArray(r.prodContainers)
+        ? asStringArray(r.prodContainers)
+        : DEFAULT_CONFIG.prodContainers,
+    prodVolumes:
+      Array.isArray(r.prodVolumes) ? asStringArray(r.prodVolumes) : DEFAULT_CONFIG.prodVolumes,
     workspaceRoots:
       Array.isArray(r.workspaceRoots) ? asStringArray(r.workspaceRoots) : DEFAULT_CONFIG.workspaceRoots,
     botAgent:
@@ -647,6 +699,22 @@ export const BaseConfig = Schema.object({
     .default(60_000)
     .min(0)
     .description("一轮在跑却超过这么久没有任何事件时，桥主动在微信提醒一次(毫秒)。0 = 关闭;不依赖审批中继是否挂上"),
+  autoAllowReadOnly: Schema.boolean()
+    .default(true)
+    .description(
+      "只读生产库 / 只读 docker 默认放行:能证明是只读的查询(docker ps/logs/inspect、"
+      + "白名单容器里的只读贴库 node、白名单卷的 docker run --rm :ro)直接允许一次,不再发卡片等 #允许。"
+      + "证明不了的一律照旧问人。每次放行都记账并在微信回一句",
+    ),
+  autoAllowNotice: Schema.boolean()
+    .default(true)
+    .description("只读自动放行时在微信回一句「已自动允许」。关掉就只在账本里留痕"),
+  prodContainers: Schema.array(Schema.string())
+    .default(["workbench-workbench-1"])
+    .description("允许只读 docker exec 进入的生产容器名(逗号分隔)。留空 = 不进任何容器"),
+  prodVolumes: Schema.array(Schema.string())
+    .default(["workbench_workbench-data"])
+    .description("允许 docker run -v …:ro 只读挂载的生产卷名。留空 = 不挂任何卷"),
   workspaceRoots: Schema.array(Schema.string())
     .default(["~/workspace"])
     .description("「#新会话 <路径>」允许建会话的目录(支持 ~)。留空 = 不允许用路径形式"),
@@ -734,6 +802,11 @@ export const HOT_FIELDS = new Set<keyof ClawbotConfig>([
   "ackAfterMs",
   "approvalReminderMs",
   "approvalGuardMs",
+  // 只读放行的判据是逐条审批读的，改完下一条审批就生效（D55）。
+  "autoAllowReadOnly",
+  "autoAllowNotice",
+  "prodContainers",
+  "prodVolumes",
   "workspaceRoots",
   "logLevel",
   // Read fresh on each send, so changing it takes effect on the next message.

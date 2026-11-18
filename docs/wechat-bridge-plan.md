@@ -428,6 +428,65 @@ v1 不写入工作台，桥自己留 90 天。
 **没做**：没有强行把"别人的会话"的审批也发到手机。那类请求（`not-ours`）仍然留给桌面，
 但现在会写一条"为什么没发"。判断依据是 agent 与会话的归属，不是猜。
 
+### D55 只读生产库 / 只读生产 docker：默认放行，但必须证明得了（2026-11-18）
+
+owner 的原话：「我目前遇到的审批请求基本上都是这些」——只读生产库、只读生产 docker。
+先去看记录，不靠印象：把 `~/.dsh/sessions` 里所有 `approval/asked` 按 `callId` 对回
+`tool/call` 的 `arguments`，得到 **72 条 bash 审批**（另有 edit/write/schedule 各一条）：
+
+- **32 条**是 `docker exec workbench-workbench-1 node -e "…new DatabaseSync('/data/workbench.db',
+  { readOnly: true })…"` / `docker run --rm -v workbench_workbench-data:/data:ro …` 的只读贴库查询；
+- **6 条**是 `docker ps / logs / inspect / system df` 这类只读子命令；
+- 其余 34 条才是真要人判断的写操作（`git push`、`docker rm`、`rm -rf`、`brew install`、
+  `cat > …` 写文件、读凭据的 python 脚本……）。
+
+也就是说，手机上点的那些「允许」，大部分不是判断，是摩擦。但「默认允许」必须有个能站住的判据，
+否则就是把审批系统关掉。所以规则写成**可证明的只读**（`src/read-only.ts`）：
+
+1. **先解析**：命令必须能被切成若干简单命令。子 shell、`$( )`、反引号、变量展开、重定向、
+   后台 `&`、未闭合引号——一律解析失败，一律照旧问人。解析器是**白名单**的：不认识的构造
+   就报错，不猜。（引号状态跨行保留，否则账本里那些多行 `node -e "…"` 全都会误判成不可解析——
+   第一版就是这样，真实回放只放行 14/72。）
+2. **再逐段判**：每一段都要在只读白名单里（`cd/sleep/echo/ls/cat/head/tail/wc/grep/jq/ps/du…`、
+   `docker ps|logs|inspect|images|stats|top|port|version|info|history|diff`、
+   `docker system df|info`、`docker container|image|volume|network|compose` 的只读子命令）。
+   只要有一段的命令不在白名单，整条不放行（`docker ps; rm -rf /` 不是「大部分只读」）。
+3. **容器与载荷**：`docker exec` 的目标必须在 `prodContainers`（默认 `workbench-workbench-1`）；
+   载荷只能是 `node -e` / `node -`，且必须同时满足「有 `DatabaseSync`」「每个 `new DatabaseSync(`
+   后面 160 字符内都有 `readOnly: true`」「没有 fs / child_process / process / eval / Function /
+   动态 import / constructor 反射」「没有 `.exec(` / `.run(`」「没有写 SQL / `PRAGMA x = …`」
+   「`require()` 只允许 `node:sqlite`」。
+4. **docker run** 必须 `--rm`、每个 `-v` 都带 `:ro`、卷在 `prodVolumes`（默认
+   `workbench_workbench-data`）、镜像是 `node`、里面同样只放行只读 node 载荷。
+
+放行的是 `allowed-once`（一次性），并且**每次都记账 + 在微信回一句**「已自动允许（只读生产库）：…」。
+默认允许不等于默默允许：账本里有 `stage: "auto-allowed"`、`rule`、`via`（auto-review / escalation /
+direct）和命令原文（截 300 字），关掉回执也只是不回那句，账本照记。
+
+怎么用：
+
+- 设置里「只读放行」开关（`autoAllowReadOnly`，默认开）、「自动放行时回一句」（`autoAllowNotice`）、
+  两个白名单（`prodContainers` / `prodVolumes`）。都是逐条审批读取的，改完下一条生效。
+- `#审批策略`：当前开关、白名单、本次已放行几次、最近一次放行，以及**最近一次没放行的原因**
+  （这一行最有用：规则边界从聊天里就能看见）。
+- `#审批自检` 多一行「只读自动放行：开（本次已放行 N 次）」。
+
+**没做 / 边界**：
+
+- **只在审批中继里做**，不挂 `tools/pre-execute`。后者会把桌面会话的自动审核一并跳过（还会省掉
+  auto-review 的模型调用），但那是另一种授权范围；这次只改「手机上的审批」。
+- **混了白名单外命令的只读链仍然问人**：真实回放里 72 条有 29 条放行，剩下的包含
+  `git log …; docker run … :ro`、`du | awk …`、`cat > /tmp/q.cjs` 这类「只读 + 别的东西」。
+  想再降摩擦就扩白名单（`git log/status/diff` 可以商量），但那是另一个决定，不顺手做。
+- **不认 `docker exec … sh -c`**：里面的脚本要再解析一层，收益小、风险大，先不做。
+- 真实回放的另一半证据：被拒的 43 条**全部**是写操作或含写操作/未知命令的链，没有一条是
+  「纯只读却被误拒」的（除上面那十来条混合链）。
+
+验证：`test/readonly.mjs` 128 条（含 `$( )`、反引号、重定向、后台、无 `readOnly: true`、
+第二个可写 handle、`child_process`、写 SQL、非白名单容器/卷/镜像、无 `--rm`、未闭合引号），
+`test/approvals.mjs` 120 条（自动放行不发卡、照样记账、开关关掉恢复发卡、未知 callId 回退、
+非 bash 不判、回执可关）；真实会话日志回放 29/72。
+
 ### D54 挂载自检说假话：「没挂上」其实是找错了自己（2026-11-12）
 
 0.2.2-rc.2 的兼容核对顺手发现的：账本里 **11-09 与 11-10 的 `stage: mount` 全是 `failed`**

@@ -63,6 +63,7 @@ const HELP: ReadonlyArray<readonly [name: string, summary: string]> = [
   ["#允许", "批准挂着的权限请求"],
   ["#拒绝", "拒绝挂着的权限请求"],
   ["#审批自检", "当场验证审批卡片能不能到手机"],
+  ["#审批策略", "看哪些只读操作现在不用问人"],
   ["#模型", "列出可用模型"],
   ["#模型 N", "把当前会话切到第 N 个模型"],
   ["#当前模式", "我现在的模式、会话与工作区"],
@@ -167,6 +168,8 @@ export interface CommandDeps {
   readonly noteStop?: (sessionId: string) => void;
   /** `#审批自检` (D53): prove the approval chain end to end. */
   readonly approvalSelfCheck?: () => Promise<string>;
+  /** `#审批策略` (D55): what the read-only auto-allow covers right now. */
+  readonly approvalPolicy?: () => string;
   /** Drop the pending 「已收到」receipt for this peer (D51). */
   readonly cancelAck?: () => void;
   /** Drop a mirror the relay still owes for a conversation that lost its binding. */
@@ -243,6 +246,12 @@ export async function runCommand(routed: Routed, deps: CommandDeps): Promise<str
       if (deps.approvalSelfCheck === undefined) return "审批链路没接上（插件没有装配审批中继）。";
       const report = await deps.approvalSelfCheck();
       record(deps, { command: "审批自检", result: "ok", summary: "跑了一次审批自检" });
+      return report;
+    }
+    case "审批策略": {
+      if (deps.approvalPolicy === undefined) return "审批策略没接上（插件没有装配审批中继）。";
+      const report = deps.approvalPolicy();
+      record(deps, { command: "审批策略", result: "ok", summary: "看了只读放行策略" });
       return report;
     }
     case "模型":

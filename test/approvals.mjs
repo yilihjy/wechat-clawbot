@@ -623,6 +623,130 @@ function dispatchWaterfall(hooks, request) {
   await bridge.dispose();
 }
 
+
+// ---------------------------------------------------------------- read-only auto-allow (D55)
+
+// Approval requests carry a callId; the command behind it is what the rule
+// judges. These tests wire the lookup directly so the rule can be exercised
+// without a real session log.
+const { ToolCallIndex } = await import(join(ROOT, "lib/tool-calls.js"));
+
+function autoHarness({ config = {}, command, callId = "call-1" } = {}) {
+  const sent = [];
+  const records = [];
+  const pending = new PendingRegistry();
+  // The real index, fed the way index.ts feeds it: a `tool/call` session event
+  // carries the arguments, and the relay only ever sees the callId.
+  const index = new ToolCallIndex();
+  if (command !== undefined) {
+    index.record("a1", { type: "tool/call", data: { callId, name: "bash", arguments: JSON.stringify({ command }) } });
+  }
+  const relay = new ApprovalRelay({
+    config: {
+      approvalTimeoutMs: 5_000,
+      sessionId: "a1",
+      autoAllowReadOnly: true,
+      autoAllowNotice: true,
+      prodContainers: ["workbench-workbench-1"],
+      prodVolumes: ["workbench_workbench-data"],
+      ...config,
+    },
+    getBridge: () => null,
+    pending,
+    sendText: async (_to, text) => { sent.push(text); },
+    ledger: { append: (draft) => records.push(draft) },
+    getOwnerId: () => "wxid_me",
+    reminderMs: () => 0,
+    lookupCommand: (sessionId, id) => index.bashCommand(sessionId, id),
+  });
+  return { sent, records, pending, relay };
+}
+
+const READ_ONLY = `docker exec -i workbench-workbench-1 node - <<'EOF' 2>&1 | tail -8
+const { DatabaseSync } = require("node:sqlite");
+const db = new DatabaseSync("/data/workbench.db", { readOnly: true });
+console.log(db.prepare("SELECT count(*) FROM articles").get());
+EOF`;
+const WRITE_ONLY = 'docker exec workbench-workbench-1 node -e \'const {DatabaseSync}=require("node:sqlite");'
+  + 'const db=new DatabaseSync("/data/workbench.db");db.prepare("UPDATE articles SET status = 1").run()\'';
+const requestAt = (over = {}) => ({
+  agent: { id: "a1" },
+  toolName: "bash",
+  callId: "call-1",
+  reason: 'Auto review denied tool "bash": 生产读取需要人工授权',
+  signal: new AbortController().signal,
+  ...over,
+});
+
+{
+  const { sent, records, pending, relay } = autoHarness({ command: READ_ONLY });
+  equal("a read-only production query is granted without the phone",
+    await relay.answer(requestAt(), async () => "allowed-once"), "allowed-once");
+  check("no #允许 card was sent", !sent.some((text) => text.includes("#允许")), sent.join(" | "));
+  check("the phone is told it was auto-allowed",
+    sent.some((text) => text.includes("已自动允许") && text.includes("只读生产库")), sent.join(" | "));
+  const entry = records.find((draft) => draft.args?.stage === "auto-allowed");
+  check("the ledger records the grant with the command",
+    entry !== undefined && String(entry.args.command).includes("readOnly: true"), JSON.stringify(records));
+  equal("the ledger names the rule", entry?.args.rule, "prod-db-read");
+  equal("the ledger says where it came from", entry?.args.via, "auto-review");
+  equal("nothing is queued for an answer", pending.size, 0);
+  check("the policy text counts the grant", relay.policyText().includes("已放行：1 次"), relay.policyText());
+}
+
+{
+  // The same shape with a writable handle: still a card.
+  const stop = new AbortController();
+  const { sent, records, pending, relay } = autoHarness({ command: WRITE_ONLY });
+  const outcome = relay.answer(requestAt({ signal: stop.signal }), async () => "allowed-once");
+  await sleep(5);
+  check("a write still asks the phone", sent.some((text) => text.includes("#允许")), sent.join(" | "));
+  check("nothing was granted by the rule", !records.some((draft) => draft.args?.stage === "auto-allowed"));
+  check("the refusal reason is kept for #审批策略",
+    relay.policyText().includes("最近一次没放行"), relay.policyText());
+  stop.abort();
+  equal("and settles as cancelled when the turn stops", await outcome, "cancelled");
+}
+
+{
+  const stop = new AbortController();
+  const { sent, relay } = autoHarness({ command: READ_ONLY, config: { autoAllowReadOnly: false } });
+  const outcome = relay.answer(requestAt({ signal: stop.signal }), async () => "allowed-once");
+  await sleep(5);
+  check("the switch being off restores the card", sent.some((text) => text.includes("#允许")), sent.join(" | "));
+  check("...and the policy text says so", relay.policyText().includes("只读自动放行：关"), relay.policyText());
+  stop.abort();
+  await outcome;
+}
+
+{
+  const stop = new AbortController();
+  const { sent, relay } = autoHarness({ command: READ_ONLY });
+  const outcome = relay.answer(requestAt({ callId: "call-unknown", signal: stop.signal }), async () => "allowed-once");
+  await sleep(5);
+  check("an unknown callId means the command is unknown, so ask", sent.some((text) => text.includes("#允许")), sent.join(" | "));
+  stop.abort();
+  await outcome;
+}
+
+{
+  const stop = new AbortController();
+  const { sent, relay } = autoHarness({ command: READ_ONLY });
+  const outcome = relay.answer(requestAt({ toolName: "edit", signal: stop.signal }), async () => "allowed-once");
+  await sleep(5);
+  check("only bash has a command to judge", sent.some((text) => text.includes("#允许")), sent.join(" | "));
+  stop.abort();
+  await outcome;
+}
+
+{
+  const { sent, relay } = autoHarness({ command: "docker ps -a", config: { autoAllowNotice: false } });
+  equal("docker ps is granted too", await relay.answer(requestAt(), async () => "allowed-once"), "allowed-once");
+  check("the notice can be switched off", !sent.some((text) => text.includes("已自动允许")), sent.join(" | "));
+  equal("the rule still shows in the policy text", relay.policyText().includes("最近一次放行：docker ps"), true);
+}
+
+
 clearInterval(keepAlive);
 
 if (failures.length > 0) {

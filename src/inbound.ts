@@ -155,6 +155,7 @@ export class InboundRouter {
   private readonly acks?: AckQueue;
   private readonly onArmAck?: () => void;
   private readonly approvalSelfCheck?: () => Promise<string>;
+  private readonly approvalPolicy?: () => string;
 
   constructor(deps: {
     config: ClawbotConfig;
@@ -180,6 +181,8 @@ export class InboundRouter {
     onArmAck?: () => void;
     /** `#审批自检` (D53). */
     approvalSelfCheck?: () => Promise<string>;
+    /** `#审批策略` (D55): what the read-only rule allows right now. */
+    approvalPolicy?: () => string;
   }) {
     this.config = deps.config;
     this.account = deps.account;
@@ -195,6 +198,7 @@ export class InboundRouter {
     this.acks = deps.acks;
     this.onArmAck = deps.onArmAck;
     this.approvalSelfCheck = deps.approvalSelfCheck;
+    this.approvalPolicy = deps.approvalPolicy;
   }
 
   /** Whether a sender may talk to the agent. */
@@ -346,6 +350,7 @@ export class InboundRouter {
         noteStop: (sessionId: string) => this.recentStops?.note(sessionId, Date.now()),
         cancelAck: () => this.acks?.cancel(sender),
         ...(this.approvalSelfCheck === undefined ? {} : { approvalSelfCheck: this.approvalSelfCheck }),
+        ...(this.approvalPolicy === undefined ? {} : { approvalPolicy: this.approvalPolicy }),
         // D29: only commands with a side effect get a line in the agent's context.
         note: (text: string) => this.bridge.noteCommand(text),
         record,
